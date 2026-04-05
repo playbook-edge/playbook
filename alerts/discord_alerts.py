@@ -422,35 +422,73 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
 
 def fire_alerts_from_signals(signals_df: pd.DataFrame,
                               ev_threshold: float = 0.04,
-                              max_alerts: int = 5,
                               webhook_url: str = None) -> int:
     """
-    Send Discord alerts for all rows above ev_threshold.
-    Capped at max_alerts to avoid spamming.
-    Returns count of successful sends.
+    Send Discord alerts for all rows above ev_threshold using tiered caps.
+
+    Caps per tier (signals sorted by PlaybookIQ descending within each tier
+    so the highest-quality plays fire first when a tier is over its cap):
+      Conservative  4–7%  EV  →  max 5
+      Moderate      7–12% EV  →  max 4
+      Aggressive   12–20% EV  →  max 3
+      Degen         20%+  EV  →  max 1
+
+    Returns total count of successful sends.
     """
+    TIER_CAPS = {
+        'CONSERVATIVE': 5,
+        'MODERATE':     4,
+        'AGGRESSIVE':   3,
+        'DEGEN':        1,
+    }
+
+    def _tier_name(ev: float) -> str:
+        if ev >= 0.20: return 'DEGEN'
+        if ev >= 0.12: return 'AGGRESSIVE'
+        if ev >= 0.07: return 'MODERATE'
+        return 'CONSERVATIVE'
+
+    def _iq(row) -> int:
+        edge = float(row['model_prob']) - float(row['implied_prob'])
+        return calculate_playbook_iq(
+            float(row['ev']), edge,
+            row.get('xfip'), row.get('ip_per_start')
+        )
+
     flagged = signals_df[signals_df['ev'] >= ev_threshold].copy()
-    flagged = flagged.sort_values('ev', ascending=False)
 
     if flagged.empty:
         print(f'  No signals above {ev_threshold:.0%} EV — no alerts sent.')
         return 0
 
-    cap     = min(len(flagged), max_alerts)
-    sent    = 0
-    skipped = 0
+    flagged['_tier'] = flagged['ev'].apply(_tier_name)
+    flagged['_iq']   = flagged.apply(_iq, axis=1)
 
-    print(f'  Sending {cap} alert(s) (capped at {max_alerts})...')
+    sent        = 0
+    tier_counts = {}
 
-    for _, row in flagged.head(cap).iterrows():
-        ok = send_alert(row.to_dict(), webhook_url)
-        if ok:
-            sent    += 1
-            print(f'    Sent: {row["player"]}  {row["side"]}  {row["line"]:.1f}  EV {row["ev"]:+.1%}')
-        else:
-            skipped += 1
-            print(f'    Failed: {row["player"]}')
+    for tier, cap in TIER_CAPS.items():
+        subset = (
+            flagged[flagged['_tier'] == tier]
+            .sort_values('_iq', ascending=False)
+            .head(cap)
+        )
+        tier_sent = 0
+        for _, row in subset.iterrows():
+            ok = send_alert(row.to_dict(), webhook_url)
+            if ok:
+                sent      += 1
+                tier_sent += 1
+                print(f'    Sent [{tier}]: {row["player"]}  {row["side"]}  '
+                      f'{row["line"]:.1f}  EV {row["ev"]:+.1%}  IQ {row["_iq"]}')
+            else:
+                print(f'    Failed: {row["player"]}')
+        tier_counts[tier] = tier_sent
 
+    summary = '  |  '.join(
+        f'{t}: {c}' for t, c in tier_counts.items() if c > 0
+    )
+    print(f'  Alerts sent: {sent} total  ({summary})')
     return sent
 
 
@@ -462,13 +500,16 @@ def fire_alerts_from_signals(signals_df: pd.DataFrame,
 
 def send_pipeline_summary(results: dict,
                           runtime_seconds: int = None,
-                          signal_count: int = None):
+                          signal_count: int = None,
+                          tier_breakdown: dict = None):
     """
     Send a pipeline run summary to the health channel.
 
     results: {step_name: str} — each value is either a plain success
              string (e.g. 'completed in 12.3s') or an error string
              starting with 'ERROR:' (e.g. 'ERROR: 401 Unauthorized').
+    tier_breakdown: optional {tier_name: count} e.g.
+             {'CONSERVATIVE': 3, 'MODERATE': 2, 'AGGRESSIVE': 1, 'DEGEN': 0}
 
     Always prints a terminal preview. Sends to Discord only if
     DISCORD_WEBHOOK_HEALTH is configured.
@@ -484,6 +525,17 @@ def send_pipeline_summary(results: dict,
     runtime_str = (f'{runtime_seconds // 60}m {runtime_seconds % 60}s'
                    if runtime_seconds is not None else 'N/A')
     signals_str = str(signal_count) if signal_count is not None else 'N/A'
+
+    # Build tier breakdown line: e.g. "🟢 3 · 🟡 2 · 🔴 1 · 🎰 0 — 6 total"
+    TIER_EMOJI = {'CONSERVATIVE': '🟢', 'MODERATE': '🟡', 'AGGRESSIVE': '🔴', 'DEGEN': '🎰'}
+    if tier_breakdown:
+        parts = [f'{TIER_EMOJI.get(t, t)} {c}' for t, c in tier_breakdown.items()]
+        total_alerts = sum(tier_breakdown.values())
+        tier_str = ' · '.join(parts) + f' — {total_alerts} total'
+        tier_str_term = '  |  '.join(f'{t}: {c}' for t, c in tier_breakdown.items()) + f'  (total: {total_alerts})'
+    else:
+        tier_str      = 'N/A'
+        tier_str_term = 'N/A'
 
     title = f'{top_icon}  Pipeline Complete — {passed}/{total} steps passed'
 
@@ -505,6 +557,7 @@ def send_pipeline_summary(results: dict,
         print(f'          {line}')
     print(f'  Runtime        : {runtime_str}')
     print(f'  Signals flagged: {signals_str}')
+    print(f'  Alerts by tier : {tier_str_term}')
     print(f'  Next run       : Tomorrow 10:30 AM ET')
     print(f'  Timestamp      : {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
     print('-' * 50 + '\n')
@@ -520,6 +573,7 @@ def send_pipeline_summary(results: dict,
     embed.add_embed_field(name='Runtime',          value=runtime_str,          inline=True)
     embed.add_embed_field(name='Signals flagged',  value=signals_str,          inline=True)
     embed.add_embed_field(name='Next run',         value='Tomorrow 10:30 AM ET', inline=True)
+    embed.add_embed_field(name='Alerts by tier',   value=tier_str,             inline=False)
     embed.set_footer(text=f'Playbook Health  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
     embed.set_timestamp()
     hook.add_embed(embed)

@@ -140,14 +140,29 @@ def main():
 
     runtime = round(time.time() - pipeline_start)
 
-    # Count flagged signals from today's run
-    signal_count = 0
+    # Count flagged signals and compute per-tier breakdown from today's run
+    signal_count   = 0
+    tier_breakdown = None
     try:
         import pandas as pd
         signals_path = os.path.join(ROOT, 'data', 'processed', 'ev_signals.csv')
         if os.path.exists(signals_path):
             sig_df = pd.read_csv(signals_path)
             signal_count = int(sig_df['flag'].sum()) if 'flag' in sig_df.columns else 0
+
+            # Compute how many alerts were sent per tier (same caps as fire_alerts_from_signals)
+            TIER_CAPS = {'CONSERVATIVE': 5, 'MODERATE': 4, 'AGGRESSIVE': 3, 'DEGEN': 1}
+            def _tier_name(ev):
+                if ev >= 0.20: return 'DEGEN'
+                if ev >= 0.12: return 'AGGRESSIVE'
+                if ev >= 0.07: return 'MODERATE'
+                return 'CONSERVATIVE'
+            if 'ev' in sig_df.columns and 'flag' in sig_df.columns:
+                flagged = sig_df[sig_df['flag'] == True].copy()
+                flagged['_tier'] = flagged['ev'].apply(_tier_name)
+                tier_breakdown = {}
+                for tier, cap in TIER_CAPS.items():
+                    tier_breakdown[tier] = min(int((flagged['_tier'] == tier).sum()), cap)
     except Exception:
         pass
 
@@ -164,7 +179,8 @@ def main():
     }
     try:
         from alerts.discord_alerts import send_pipeline_summary
-        send_pipeline_summary(results_str, runtime_seconds=runtime, signal_count=signal_count)
+        send_pipeline_summary(results_str, runtime_seconds=runtime,
+                              signal_count=signal_count, tier_breakdown=tier_breakdown)
     except Exception as e:
         logger.log(f'  Health summary failed: {e}')
 
