@@ -49,93 +49,221 @@ def add_batting_team(df):
 
 
 # ---------------------------------------------------------------------------
-# Part 1: Team K-rates by batter handedness
+# Part 1: Team K-rates by batter handedness  (incremental Statcast pulls)
+#
+# How it works:
+#   - First ever run:   full pull from SEASON_START, stores running K/PA
+#     counts in team_krates_cache and records TODAY in statcast_pull_log.
+#   - Same-day re-run:  fetch_date == TODAY in team_krates_cache toinstant
+#     return, zero API calls.
+#   - Next day's run:   incremental pull from last_pull_date+1 to TODAY,
+#     adds new K/PA counts to the stored totals, recalculates K-rates,
+#     updates both tables.
+#
+# team_krates_cache stores k_vs_rhp / k_vs_lhp (raw K counts) in addition
+# to the aggregated K-rates so daily merging can be done without re-pulling
+# historical data.
 # ---------------------------------------------------------------------------
 
+def _aggregate_krates(sc_df: pd.DataFrame) -> dict:
+    """
+    Given a raw Statcast DataFrame, return per-team K/PA counts by pitcher hand.
+    Returns: { team: {'pa_rhp', 'k_rhp', 'pa_lhp', 'k_lhp'} }
+    """
+    sc_df  = add_batting_team(sc_df)
+    pa_df  = sc_df[sc_df['events'].notna()].copy()
+    totals = {}
+
+    for hand in ('R', 'L'):
+        pa_key = 'pa_rhp' if hand == 'R' else 'pa_lhp'
+        k_key  = 'k_rhp'  if hand == 'R' else 'k_lhp'
+        subset = pa_df[pa_df['p_throws'] == hand]
+        stats  = (
+            subset
+            .groupby('batting_team')
+            .agg(pa=('events', 'count'),
+                 k=('events', lambda x: (x == 'strikeout').sum()))
+            .reset_index()
+        )
+        for _, row in stats.iterrows():
+            team = row['batting_team']
+            if team not in totals:
+                totals[team] = {'pa_rhp': 0, 'k_rhp': 0, 'pa_lhp': 0, 'k_lhp': 0}
+            totals[team][pa_key] = int(row['pa'])
+            totals[team][k_key]  = int(row['k'])
+
+    return totals
+
+
+def _totals_to_wide(totals: dict) -> pd.DataFrame:
+    """Convert {team: {pa_rhp, k_rhp, pa_lhp, k_lhp}} to the wide K-rate DataFrame."""
+    rows = []
+    for team, t in totals.items():
+        vs_rhp = round(t['k_rhp'] / t['pa_rhp'], 3) if t['pa_rhp'] > 0 else None
+        vs_lhp = round(t['k_lhp'] / t['pa_lhp'], 3) if t['pa_lhp'] > 0 else None
+        rows.append({
+            'team':      team,
+            'vs_RHP':    vs_rhp,
+            'vs_LHP':    vs_lhp,
+            'pa_vs_rhp': t['pa_rhp'],
+            'pa_vs_lhp': t['pa_lhp'],
+            'k_vs_rhp':  t['k_rhp'],
+            'k_vs_lhp':  t['k_lhp'],
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values('vs_RHP', ascending=False).reset_index(drop=True)
+
+
+def _save_krates_to_supabase(wide: pd.DataFrame, total_rows: int):
+    """Overwrite team_krates_cache and update statcast_pull_log."""
+    try:
+        from database import get_client
+        client = get_client()
+        if not client:
+            return
+
+        # Overwrite K-rates cache
+        client.table('team_krates_cache').delete().neq('id', 0).execute()
+        records = []
+        for _, r in wide.iterrows():
+            records.append({
+                'fetch_date': TODAY,
+                'team':       str(r['team']),
+                'vs_rhp':     float(r['vs_RHP'])    if pd.notna(r.get('vs_RHP'))    else None,
+                'vs_lhp':     float(r['vs_LHP'])    if pd.notna(r.get('vs_LHP'))    else None,
+                'pa_vs_rhp':  int(r['pa_vs_rhp'])   if pd.notna(r.get('pa_vs_rhp')) else None,
+                'pa_vs_lhp':  int(r['pa_vs_lhp'])   if pd.notna(r.get('pa_vs_lhp')) else None,
+                'k_vs_rhp':   int(r['k_vs_rhp'])    if pd.notna(r.get('k_vs_rhp'))  else None,
+                'k_vs_lhp':   int(r['k_vs_lhp'])    if pd.notna(r.get('k_vs_lhp'))  else None,
+            })
+        client.table('team_krates_cache').insert(records).execute()
+
+        # Update pull log (keep only one row)
+        client.table('statcast_pull_log').delete().neq('id', 0).execute()
+        client.table('statcast_pull_log').insert({
+            'last_pull_date':    TODAY,
+            'total_rows_cached': total_rows,
+        }).execute()
+
+        print(f'  Supabase updated — {len(records)} teams, {total_rows:,} total rows logged.')
+    except Exception as e:
+        print(f'  Supabase cache write failed ({e}) — continuing with in-memory result.')
+
+
 def build_team_krates():
-    # Check Supabase cache first — the full-season Statcast pull is the slowest
-    # step in the pipeline. If we already ran it today, reuse the cached result.
+    """
+    Build team K-rate splits using incremental Statcast pulls.
+    See module docstring above for the three execution paths.
+    """
+    t_start = time.time()
+
+    # ── Path 1: already ran today — instant return ───────────────────────────
     try:
         from database import get_client
         client = get_client()
         if client:
             resp = client.table('team_krates_cache').select('*').eq('fetch_date', TODAY).execute()
             if resp.data:
-                print(f'  Using cached team K-rates from Supabase ({len(resp.data)} teams).')
-                df = pd.DataFrame(resp.data).drop(columns=['id', 'fetch_date'], errors='ignore')
+                elapsed = round(time.time() - t_start, 1)
+                print(f'  Using cached team K-rates from today ({len(resp.data)} teams) [{elapsed}s]')
+                df = pd.DataFrame(resp.data).drop(
+                    columns=['id', 'fetch_date', 'k_vs_rhp', 'k_vs_lhp'], errors='ignore')
                 df = df.rename(columns={'vs_rhp': 'vs_RHP', 'vs_lhp': 'vs_LHP'})
                 return df.sort_values('vs_RHP', ascending=False).reset_index(drop=True)
     except Exception as e:
-        print(f'  Supabase cache check failed ({e}) — fetching fresh.')
+        print(f'  Cache check failed ({e}) — proceeding with pull.')
 
-    print(f"Fetching Statcast data ({SEASON_START} to {TODAY}) for team K-rate splits...")
-    print("  (This may take 15-30 seconds)")
-    time.sleep(DELAY)
+    # ── Determine last pull date and load existing totals ────────────────────
+    last_pull_date    = None
+    existing_totals   = {}
+    total_rows_so_far = 0
+    can_increment     = False
 
-    sc = statcast(SEASON_START, TODAY)
-    sc = add_batting_team(sc)
-
-    # Only rows where a plate appearance ended
-    pa_df = sc[sc['events'].notna()].copy()
-
-    results = []
-    for hand in ('R', 'L'):
-        label = 'vs_RHP' if hand == 'R' else 'vs_LHP'
-        subset = pa_df[pa_df['p_throws'] == hand]  # pitcher handedness
-
-        team_stats = (
-            subset
-            .groupby('batting_team')
-            .agg(
-                pa=('events', 'count'),
-                k=('events', lambda x: (x == 'strikeout').sum())
-            )
-            .reset_index()
-        )
-        team_stats['k_pct']    = (team_stats['k'] / team_stats['pa']).round(3)
-        team_stats['matchup']  = label
-        team_stats['hand']     = hand
-        results.append(team_stats)
-
-    combined = pd.concat(results, ignore_index=True)
-
-    # Pivot to wide format: one row per team, columns for vs_RHP and vs_LHP
-    wide = combined.pivot(index='batting_team', columns='matchup', values='k_pct').reset_index()
-    wide.columns.name = None
-    wide = wide.rename(columns={'batting_team': 'team'})
-
-    # Add raw PA counts for context
-    pa_rhp = combined[combined['hand'] == 'R'][['batting_team', 'pa']].rename(
-        columns={'batting_team': 'team', 'pa': 'pa_vs_rhp'})
-    pa_lhp = combined[combined['hand'] == 'L'][['batting_team', 'pa']].rename(
-        columns={'batting_team': 'team', 'pa': 'pa_vs_lhp'})
-
-    wide = wide.merge(pa_rhp, on='team', how='left')
-    wide = wide.merge(pa_lhp, on='team', how='left')
-    wide = wide.sort_values('vs_RHP', ascending=False).reset_index(drop=True)
-
-    # Save to Supabase so Railway skips this slow fetch on future runs today
     try:
         from database import get_client
         client = get_client()
         if client:
-            client.table('team_krates_cache').delete().neq('id', 0).execute()
-            records = [
-                {
-                    'fetch_date': TODAY,
-                    'team':       str(r['team']),
-                    'vs_rhp':     float(r['vs_RHP']) if pd.notna(r.get('vs_RHP')) else None,
-                    'vs_lhp':     float(r['vs_LHP']) if pd.notna(r.get('vs_LHP')) else None,
-                    'pa_vs_rhp':  int(r['pa_vs_rhp']) if pd.notna(r.get('pa_vs_rhp')) else None,
-                    'pa_vs_lhp':  int(r['pa_vs_lhp']) if pd.notna(r.get('pa_vs_lhp')) else None,
-                }
-                for _, r in wide.iterrows()
-            ]
-            client.table('team_krates_cache').insert(records).execute()
-            print(f'  Team K-rates cached to Supabase ({len(records)} teams).')
-    except Exception as e:
-        print(f'  Supabase cache write failed ({e}) — continuing.')
+            log_resp = (client.table('statcast_pull_log')
+                              .select('*')
+                              .order('id', desc=True)
+                              .limit(1)
+                              .execute())
+            if log_resp.data:
+                last_pull_date    = log_resp.data[0]['last_pull_date']
+                total_rows_so_far = int(log_resp.data[0].get('total_rows_cached', 0))
 
+                # Load existing running totals (needs k_vs_rhp/k_vs_lhp columns)
+                cache_resp = client.table('team_krates_cache').select('*').execute()
+                if cache_resp.data and cache_resp.data[0].get('k_vs_rhp') is not None:
+                    for row in cache_resp.data:
+                        existing_totals[row['team']] = {
+                            'pa_rhp': int(row.get('pa_vs_rhp') or 0),
+                            'k_rhp':  int(row.get('k_vs_rhp')  or 0),
+                            'pa_lhp': int(row.get('pa_vs_lhp') or 0),
+                            'k_lhp':  int(row.get('k_vs_lhp')  or 0),
+                        }
+                    can_increment = True
+    except Exception as e:
+        print(f'  Pull log check failed ({e}) — doing full pull.')
+
+    # ── Path 2: incremental pull ─────────────────────────────────────────────
+    if can_increment and last_pull_date and last_pull_date < TODAY:
+        from datetime import datetime as _dt, timedelta
+        pull_from = (_dt.strptime(str(last_pull_date), '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        print(f'  Incremental pull: {pull_from} to{TODAY}  '
+              f'(baseline: {total_rows_so_far:,} rows)')
+        time.sleep(DELAY)
+
+        sc_new = statcast(pull_from, TODAY)
+        new_row_count = len(sc_new)
+        print(f'  Fetched {new_row_count:,} new rows.')
+
+        if sc_new.empty or new_row_count == 0:
+            # Off-day — no new data, return existing cache as-is
+            print('  No new games found. Returning existing K-rates.')
+            wide = _totals_to_wide(existing_totals)
+            _save_krates_to_supabase(wide, total_rows_so_far)
+            elapsed = round(time.time() - t_start, 1)
+            print(f'  Done [{elapsed}s]')
+            return wide
+
+        new_totals = _aggregate_krates(sc_new)
+
+        # Merge: add new counts onto existing running totals
+        all_teams = set(existing_totals) | set(new_totals)
+        merged = {}
+        for team in all_teams:
+            ex = existing_totals.get(team, {'pa_rhp': 0, 'k_rhp': 0, 'pa_lhp': 0, 'k_lhp': 0})
+            nw = new_totals.get(team,      {'pa_rhp': 0, 'k_rhp': 0, 'pa_lhp': 0, 'k_lhp': 0})
+            merged[team] = {
+                'pa_rhp': ex['pa_rhp'] + nw['pa_rhp'],
+                'k_rhp':  ex['k_rhp']  + nw['k_rhp'],
+                'pa_lhp': ex['pa_lhp'] + nw['pa_lhp'],
+                'k_lhp':  ex['k_lhp']  + nw['k_lhp'],
+            }
+
+        wide = _totals_to_wide(merged)
+        _save_krates_to_supabase(wide, total_rows_so_far + new_row_count)
+        elapsed = round(time.time() - t_start, 1)
+        print(f'  Incremental update complete [{elapsed}s]')
+        return wide
+
+    # ── Path 3: full pull — first run or missing baseline ────────────────────
+    print(f'  Full pull: {SEASON_START} to{TODAY}  (establishing baseline)')
+    print('  (This takes 15-60 seconds; subsequent runs will be incremental)')
+    time.sleep(DELAY)
+
+    sc_full = statcast(SEASON_START, TODAY)
+    full_row_count = len(sc_full)
+    print(f'  Fetched {full_row_count:,} rows.')
+
+    totals = _aggregate_krates(sc_full)
+    wide   = _totals_to_wide(totals)
+    _save_krates_to_supabase(wide, full_row_count)
+    elapsed = round(time.time() - t_start, 1)
+    print(f'  Full pull complete [{elapsed}s]')
     return wide
 
 
