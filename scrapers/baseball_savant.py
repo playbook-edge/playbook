@@ -5,15 +5,19 @@ Pulls today's MLB probable starters and fetches their last-30-day
 stats directly from Baseball Savant (Statcast) via pybaseball.
 
 Stats per pitcher (30-day window):
-  k_pct  : strikeout rate  (K / batters faced)
-  xfip   : xFIP            (from FanGraphs if available, else estimated)
-  velo   : avg fastball velocity
-  babip  : batting average on balls in play
+  k_pct      : strikeout rate  (K / batters faced)
+  xfip       : xFIP            (from FanGraphs if available, else estimated)
+  velo       : avg fastball velocity (30-day)
+  velo_trend : fastball velo last 7 days minus 30-day avg (+ = gaining, - = losing)
+  spin_rate  : avg fastball spin rate (RPM)
+  pitch_mix  : JSON dict of pitch type usage percentages
+  babip      : batting average on balls in play
 
 No API keys required.
 """
 
 import os
+import json
 import time
 import requests
 import pandas as pd
@@ -108,7 +112,8 @@ def fetch_pitcher_statcast(mlb_id, name):
 # ---------------------------------------------------------------------------
 
 def compute_metrics(df):
-    metrics = {'k_pct': None, 'velo': None, 'babip': None}
+    metrics = {'k_pct': None, 'velo': None, 'velo_trend': None,
+               'spin_rate': None, 'pitch_mix': None, 'babip': None}
 
     if df is None or df.empty:
         return metrics
@@ -122,11 +127,32 @@ def compute_metrics(df):
     if pa_count > 0:
         metrics['k_pct'] = round(k_count / pa_count, 3)
 
-    # --- Average fastball velocity ---
+    # --- Average fastball velocity (30-day) ---
     fb_mask = df['pitch_type'].isin(FASTBALL_TYPES)
     fb_df   = df[fb_mask & df['release_speed'].notna()]
     if not fb_df.empty:
         metrics['velo'] = round(fb_df['release_speed'].mean(), 1)
+
+    # --- Velocity trend: last 7 days vs 30-day average ---
+    # Positive = pitcher throwing harder recently, negative = losing velo
+    if not fb_df.empty and 'game_date' in fb_df.columns:
+        cutoff = END_DATE - timedelta(days=7)
+        recent = fb_df[pd.to_datetime(fb_df['game_date']) >= cutoff]
+        if len(recent) >= 5:
+            metrics['velo_trend'] = round(recent['release_speed'].mean() - fb_df['release_speed'].mean(), 1)
+
+    # --- Fastball spin rate (RPM) ---
+    if 'release_spin_rate' in df.columns:
+        fb_spin = df[fb_mask & df['release_spin_rate'].notna()]
+        if not fb_spin.empty:
+            metrics['spin_rate'] = round(fb_spin['release_spin_rate'].mean(), 0)
+
+    # --- Pitch mix: percentage of each pitch type thrown ---
+    typed = df[df['pitch_type'].notna()]
+    if not typed.empty:
+        counts = typed['pitch_type'].value_counts()
+        total  = counts.sum()
+        metrics['pitch_mix'] = json.dumps({k: round(v / total, 3) for k, v in counts.items()})
 
     # --- BABIP ---
     # BABIP = (H - HR) / (AB - K - HR + SF)
@@ -192,13 +218,16 @@ def run():
         sc_data = fetch_pitcher_statcast(p['mlb_id'], p['name'])
         metrics = compute_metrics(sc_data)
         rows.append({
-            'name':   p['name'],
-            'team':   p['team'],
-            'throws': p.get('throws', 'R'),
-            'k_pct':  metrics['k_pct'],
-            'xfip':   lookup_xfip(p['name']),
-            'velo':   metrics['velo'],
-            'babip':  metrics['babip'],
+            'name':       p['name'],
+            'team':       p['team'],
+            'throws':     p.get('throws', 'R'),
+            'k_pct':      metrics['k_pct'],
+            'xfip':       lookup_xfip(p['name']),
+            'velo':       metrics['velo'],
+            'velo_trend': metrics['velo_trend'],
+            'spin_rate':  metrics['spin_rate'],
+            'pitch_mix':  metrics['pitch_mix'],
+            'babip':      metrics['babip'],
         })
 
     report = pd.DataFrame(rows)
