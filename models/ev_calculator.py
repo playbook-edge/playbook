@@ -327,7 +327,8 @@ def build_ev_signals(props_df:    pd.DataFrame,
                      stats_df:    pd.DataFrame,
                      bankroll:    float = 1000.0,
                      baselines_df: pd.DataFrame | None = None,
-                     krates_df:   pd.DataFrame | None = None) -> pd.DataFrame:
+                     krates_df:   pd.DataFrame | None = None,
+                     umpire_data: dict | None = None) -> pd.DataFrame:
     """
     Core matching and EV calculation.
 
@@ -338,6 +339,10 @@ def build_ev_signals(props_df:    pd.DataFrame,
       4. Calculate model probability for Over and Under
       5. Calculate EV for both sides
       6. Flag rows above EV_THRESHOLD
+
+    umpire_data: dict returned by umpire_scraper.get_todays_umpires().
+                 Keys are normalised '{away} @ {home}' matchup strings.
+                 Applied after the batter matchup adjustment.
     """
     from models.player_baseline import lookup_baseline
 
@@ -485,8 +490,37 @@ def build_ev_signals(props_df:    pd.DataFrame,
                 pitcher_team, str(prop.get('matchup', '')), throws, krates_df
             )
 
-        # Apply matchup and velocity trend factors to blended K/9
-        adjusted_k9 = blended_k9 * matchup_factor * velo_factor
+        # ── Umpire adjustment ─────────────────────────────────────────────
+        # Match this prop's matchup to today's home plate umpire profile.
+        # Tight zone (>60th pct) → +3% K probability boost.
+        # Large zone (<40th pct) → -3% K probability reduction.
+        # Inverse applied to innings props (more Ks → longer games → more IP).
+        # No data available → factor stays 1.0, note logged.
+        umpire_name       = None
+        umpire_adjustment = 1.0
+        umpire_note       = 'no umpire data'
+
+        if umpire_data:
+            matchup_str = str(prop.get('matchup', '')).lower().strip()
+            # Direct match first; then try any entry whose key overlaps
+            ump_info = umpire_data.get(matchup_str)
+            if ump_info is None:
+                # Partial match: check if any umpire matchup key is contained
+                # in or contains the prop's matchup string
+                for k, v in umpire_data.items():
+                    parts = k.split(' @ ')
+                    if len(parts) == 2:
+                        if parts[0] in matchup_str or parts[1] in matchup_str:
+                            ump_info = v
+                            break
+
+            if ump_info:
+                umpire_name       = ump_info.get('umpire_name')
+                umpire_adjustment = float(ump_info.get('k_factor', 1.0))
+                umpire_note       = ump_info.get('note', '')
+
+        # Apply matchup, velocity trend, and umpire factors to blended K/9
+        adjusted_k9 = blended_k9 * matchup_factor * velo_factor * umpire_adjustment
 
         # ── Route to the correct probability model ────────────
         if prop_type == 'pitcher_innings':
@@ -561,8 +595,10 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'throws':           throws,
             'opp_team':         opp_team,
             'opp_k_pct':        opp_k_pct,
-            'matchup_factor':   matchup_factor,
-            'low_line_note':    low_line_note,
+            'matchup_factor':    matchup_factor,
+            'low_line_note':     low_line_note,
+            'umpire_name':       umpire_name,
+            'umpire_adjustment': round(umpire_adjustment, 3),
         }
 
         # Over row
@@ -727,8 +763,23 @@ def run():
     else:
         print('No team K-rates found — run scrapers/fangraphs.py first')
 
+    # Load umpire data (optional — degrades gracefully if unavailable)
+    umpire_data = None
+    try:
+        from scrapers.umpire_scraper import get_todays_umpires, build_umpire_profiles
+        profiles    = build_umpire_profiles()
+        umpire_data = get_todays_umpires(profiles)
+        if umpire_data:
+            covered = sum(1 for v in umpire_data.values() if v.get('umpire_name'))
+            print(f'Umpire data loaded: {covered}/{len(umpire_data)} games with profiles')
+        else:
+            print('Umpire data: no assignments found (off-day or API unavailable)')
+    except Exception as e:
+        print(f'Umpire data unavailable ({e}) — continuing without adjustment')
+
     bankroll = 1000.0
-    signals  = build_ev_signals(props_df, savant_df, stats_df, bankroll, baselines_df, krates_df)
+    signals  = build_ev_signals(props_df, savant_df, stats_df, bankroll,
+                                baselines_df, krates_df, umpire_data)
 
     if signals.empty:
         print('\nNo signals generated — check that pitcher names match across files.')

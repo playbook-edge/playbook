@@ -242,6 +242,72 @@ def update_paper_trade_result(player: str, trade_date: str, side: str,
 
 
 # ─────────────────────────────────────────────
+# umpire_profiles
+# ─────────────────────────────────────────────
+
+def save_umpire_profiles(profiles: list) -> int:
+    """
+    Overwrite the umpire_profiles table with a fresh set of profiles.
+    Called by umpire_scraper.build_umpire_profiles() on weekly refresh.
+    Returns the number of rows inserted.
+    """
+    client = get_client()
+    if client is None:
+        return 0
+    try:
+        client.table('umpire_profiles').delete().neq('id', 0).execute()
+        rows = [
+            {
+                'umpire_name':            _clean(p.get('umpire_name')),
+                'umpire_id':              _clean(p.get('umpire_id')),
+                'zone_size_pct':          int(p['zone_size_pct']) if p.get('zone_size_pct') is not None else None,
+                'k_per_game':             _clean(p.get('k_per_game')),
+                'runs_per_game':          _clean(p.get('runs_per_game')),
+                'first_pitch_strike_pct': _clean(p.get('first_pitch_strike_pct')),
+                'last_updated':           _clean(p.get('last_updated')),
+            }
+            for p in profiles
+        ]
+        client.table('umpire_profiles').insert(rows).execute()
+        return len(rows)
+    except Exception as e:
+        print(f'  Supabase umpire_profiles save error: {e}')
+        return 0
+
+
+def get_umpire_profiles() -> list:
+    """Return all rows from umpire_profiles as a list of dicts."""
+    client = get_client()
+    if client is None:
+        return []
+    try:
+        resp = client.table('umpire_profiles').select('*').execute()
+        return resp.data or []
+    except Exception as e:
+        print(f'  Supabase umpire_profiles read error: {e}')
+        return []
+
+
+def get_umpire_last_updated() -> str | None:
+    """Return the most recent last_updated date in umpire_profiles, or None."""
+    client = get_client()
+    if client is None:
+        return None
+    try:
+        resp = (client.table('umpire_profiles')
+                      .select('last_updated')
+                      .order('last_updated', desc=True)
+                      .limit(1)
+                      .execute())
+        if resp.data:
+            return resp.data[0]['last_updated']
+        return None
+    except Exception as e:
+        print(f'  Supabase umpire last_updated check error: {e}')
+        return None
+
+
+# ─────────────────────────────────────────────
 # closing_lines
 # ─────────────────────────────────────────────
 

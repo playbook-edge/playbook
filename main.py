@@ -78,6 +78,10 @@ def step_fangraphs():
     from scrapers.fangraphs import run
     run()
 
+def step_umpires():
+    from scrapers.umpire_scraper import build_umpire_profiles
+    build_umpire_profiles()
+
 def step_historical():
     from scrapers.historical_stats import run
     run()
@@ -120,12 +124,13 @@ def main():
     results        = {}
 
     steps = [
-        ('Baseball Savant',  'Step 1/6  Baseball Savant',  step_savant),
-        ('FanGraphs',        'Step 2/6  FanGraphs',        step_fangraphs),
-        ('Historical Stats', 'Step 3/6  Historical Stats', step_historical),
-        ('Player Baselines', 'Step 4/6  Player Baselines', step_baseline),
-        ('Odds API',         'Step 5/6  Odds API',         step_odds),
-        ('EV Calculator',    'Step 6/6  EV + Alerts',      step_ev),
+        ('Baseball Savant',  'Step 1/7  Baseball Savant',   step_savant),
+        ('FanGraphs',        'Step 2/7  FanGraphs',         step_fangraphs),
+        ('Umpires',          'Step 2.5/7  Umpire Profiles', step_umpires),
+        ('Historical Stats', 'Step 3/7  Historical Stats',  step_historical),
+        ('Player Baselines', 'Step 4/7  Player Baselines',  step_baseline),
+        ('Odds API',         'Step 5/7  Odds API',          step_odds),
+        ('EV Calculator',    'Step 6/7  EV + Alerts',       step_ev),
     ]
 
     for key, name, fn in steps:
@@ -168,7 +173,7 @@ def main():
 
     passed = sum(1 for r in results.values() if r['ok'])
     logger.log('')
-    logger.log(f'Pipeline finished: {passed}/6 steps passed')
+    logger.log(f'Pipeline finished: {passed}/7 steps passed')
     logger.log(f'Log saved to: {LOG_FILE}')
     logger.log('=' * 50)
 
