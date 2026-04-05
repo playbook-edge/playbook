@@ -2,8 +2,8 @@ pybaseball          # Pull MLB stats and historical data
 anthropic           # Claude AI for game analysis and insights
 requests            # Make HTTP calls to APIs
 supabase            # Connect to Supabase database
-apscheduler         # Schedule the bot to run automatically
 python-dotenv       # Load .env file into environment variables
 discord-webhook     # Send alerts to Discord
 pandas              # Work with tabular data (stats, odds)
 numpy               # Math and number crunching
+scipy               # Poisson/Normal distributions for probability model
