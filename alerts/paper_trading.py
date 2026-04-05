@@ -529,6 +529,14 @@ def auto_resolve():
     else:
         print('\nNo bets resolved — all games may still be in progress.')
 
+    # Send daily heartbeat to health channel
+    try:
+        from alerts.discord_alerts import send_heartbeat
+        game_count = sum(len(v) for v in box_scores.values())
+        send_heartbeat(game_count=game_count, pending_trades=len(skipped))
+    except Exception as e:
+        print(f'  Heartbeat error: {e}')
+
 
 # ─────────────────────────────────────────────
 # Resolve pending bets (mark WIN or LOSS)
