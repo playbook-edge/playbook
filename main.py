@@ -108,6 +108,14 @@ def step_fangraphs():
     from scrapers.fangraphs import run
     run()
 
+def step_historical():
+    from scrapers.historical_stats import run
+    run()
+
+def step_baseline():
+    from models.player_baseline import run
+    run()
+
 def step_odds():
     from scrapers.odds_api import run
     run()
@@ -140,15 +148,17 @@ def main():
 
     results = {}
 
-    results['Baseball Savant'] = run_step(logger, 'Step 1/4  Baseball Savant',  step_savant)
-    results['FanGraphs']       = run_step(logger, 'Step 2/4  FanGraphs',         step_fangraphs)
-    results['Odds API']        = run_step(logger, 'Step 3/4  Odds API',           step_odds)
-    results['EV Calculator']   = run_step(logger, 'Step 4/4  EV + Alerts',        step_ev)
+    results['Baseball Savant'] = run_step(logger, 'Step 1/6  Baseball Savant',  step_savant)
+    results['FanGraphs']       = run_step(logger, 'Step 2/6  FanGraphs',         step_fangraphs)
+    results['Historical Stats']= run_step(logger, 'Step 3/6  Historical Stats',  step_historical)
+    results['Player Baselines']= run_step(logger, 'Step 4/6  Player Baselines',  step_baseline)
+    results['Odds API']        = run_step(logger, 'Step 5/6  Odds API',           step_odds)
+    results['EV Calculator']   = run_step(logger, 'Step 6/6  EV + Alerts',        step_ev)
 
     # Summary
     passed = sum(1 for r in results.values() if r['ok'])
     logger.log('')
-    logger.log(f'Pipeline finished: {passed}/4 steps passed')
+    logger.log(f'Pipeline finished: {passed}/6 steps passed')
     logger.log(f'Log saved to: {LOG_FILE}')
     logger.log('=' * 50)
 

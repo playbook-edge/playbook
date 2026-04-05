@@ -197,12 +197,33 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
     embed.add_embed_field(name='Book',          value=book_str,                                 inline=True)
     embed.add_embed_field(name='Game Time',     value=game_time,                                inline=True)
 
-    # Row 4 — pitcher context
+    # Row 4 — pitcher context + historical
     xfip_str = f'{float(xfip):.2f}' if xfip is not None and not pd.isna(xfip) else 'N/A'
     ip_str   = f'{float(ip_per_start):.1f}' if ip_per_start is not None and not pd.isna(ip_per_start) else 'N/A'
-    embed.add_embed_field(name='xFIP (30d)',    value=xfip_str,  inline=True)
-    embed.add_embed_field(name='IP/Start',      value=ip_str,    inline=True)
-    embed.add_embed_field(name='Matchup',       value=matchup_str, inline=True)
+
+    # Historical K/9 trend
+    k9_curr = signal.get('k9_current')
+    k9_hist = signal.get('k9_historical')
+    k9_trend = signal.get('k9_trend', 'NEW')
+    trend_arrow = {'UP': 'UP', 'DOWN': 'DOWN', 'STABLE': 'STABLE', 'NEW': 'NEW'}.get(str(k9_trend), 'NEW')
+    reliability = signal.get('hist_reliability')
+
+    if k9_curr is not None and k9_hist is not None and not pd.isna(k9_hist):
+        hist_str = f'{float(k9_hist):.1f} K/9 hist  |  {float(k9_curr):.1f} now  [{trend_arrow}]'
+    elif k9_curr is not None:
+        hist_str = f'{float(k9_curr):.1f} K/9 (no history)'
+    else:
+        hist_str = 'N/A'
+
+    reliability_str = f'{int(reliability)}/100' if reliability is not None and not pd.isna(reliability) else 'N/A'
+
+    embed.add_embed_field(name='xFIP (season)',   value=xfip_str,       inline=True)
+    embed.add_embed_field(name='IP/Start',        value=ip_str,         inline=True)
+    embed.add_embed_field(name='Matchup',         value=matchup_str,    inline=True)
+
+    embed.add_embed_field(name='K/9 vs History',  value=hist_str,       inline=False)
+    embed.add_embed_field(name='Data Reliability',value=reliability_str, inline=True)
+    embed.add_embed_field(name='Blended K/9',     value=f'{float(signal.get("k9_used", 0)):.1f}', inline=True)
 
     embed.set_footer(text=f'Playbook Edge  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
     embed.set_timestamp()

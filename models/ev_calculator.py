@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 RAW       = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
 PROCESSED = os.path.join(os.path.dirname(__file__), '..', 'data', 'processed')
+HIST      = os.path.join(os.path.dirname(__file__), '..', 'data', 'historical')
 
 EV_THRESHOLD = 0.04   # flag anything above 4% EV
 MIN_EV_KELLY = 0.01   # don't recommend a stake below 1% EV
@@ -194,20 +195,24 @@ def match_name(target: str, candidates: pd.Series) -> str | None:
     return None
 
 
-def build_ev_signals(props_df: pd.DataFrame,
-                     savant_df: pd.DataFrame,
-                     stats_df:  pd.DataFrame,
-                     bankroll:  float = 1000.0) -> pd.DataFrame:
+def build_ev_signals(props_df:    pd.DataFrame,
+                     savant_df:   pd.DataFrame,
+                     stats_df:    pd.DataFrame,
+                     bankroll:    float = 1000.0,
+                     baselines_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Core matching and EV calculation.
 
     For each prop line:
       1. Look up the pitcher's stats
-      2. Estimate expected Ks via Poisson
-      3. Calculate model probability for Over and Under
-      4. Calculate EV for both sides
-      5. Flag rows above EV_THRESHOLD
+      2. Blend current K/9 with historical baseline (60/40 weighting)
+      3. Estimate expected Ks via Poisson
+      4. Calculate model probability for Over and Under
+      5. Calculate EV for both sides
+      6. Flag rows above EV_THRESHOLD
     """
+    from models.player_baseline import lookup_baseline
+
     rows = []
 
     for _, prop in props_df.iterrows():
@@ -234,11 +239,32 @@ def build_ev_signals(props_df: pd.DataFrame,
             else:
                 continue   # pitcher not found in any dataset — skip
 
-        line      = float(prop['line'])
-        over_odds = float(prop['over_odds'])
-        under_odds = float(prop.get('under_odds', over_odds))  # fallback if missing
+        line       = float(prop['line'])
+        over_odds  = float(prop['over_odds'])
+        under_odds = float(prop.get('under_odds', over_odds))
 
-        expected_ks = estimate_expected_ks(k9, ip_per_start)
+        # ── Historical baseline blending ─────────────────────
+        # If we have 2yr history, blend: 60% current K/9 + 40% historical K/9
+        # This prevents fluky small-sample current stats from dominating.
+        # Also carry trend/reliability into the signal rows.
+        hist_k9          = None
+        hist_reliability = None
+        k9_trend         = 'NEW'
+        blended_k9       = k9   # default: unblended
+
+        if baselines_df is not None:
+            bl = lookup_baseline(player, baselines_df)
+            if bl and pd.notna(bl.get('hist_k9')):
+                hist_k9          = float(bl['hist_k9'])
+                hist_reliability = int(bl.get('reliability', 50))
+                k9_trend         = bl.get('k9_trend', 'NEW')
+
+                # Weight blend by reliability: high reliability = trust history more
+                hist_weight = 0.30 + (hist_reliability / 100) * 0.20   # 30-50%
+                curr_weight = 1 - hist_weight
+                blended_k9  = curr_weight * k9 + hist_weight * hist_k9
+
+        expected_ks = estimate_expected_ks(blended_k9, ip_per_start)
         model_over  = prob_over_line(expected_ks, line)
         model_under = prob_under_line(expected_ks, line)
 
@@ -257,14 +283,18 @@ def build_ev_signals(props_df: pd.DataFrame,
             xfip_val = st.get('xfip') if pd.notna(st.get('xfip')) else None
 
         base = {
-            'player':       player,
-            'matchup':      prop.get('matchup', ''),
-            'book':         prop.get('book', ''),
-            'line':         line,
-            'expected_ks':  round(expected_ks, 2),
-            'k9_used':      round(k9, 2),
-            'ip_per_start': round(ip_per_start, 1),
-            'xfip':         xfip_val,
+            'player':           player,
+            'matchup':          prop.get('matchup', ''),
+            'book':             prop.get('book', ''),
+            'line':             line,
+            'expected_ks':      round(expected_ks, 2),
+            'k9_used':          round(blended_k9, 2),
+            'k9_current':       round(k9, 2),
+            'k9_historical':    round(hist_k9, 2) if hist_k9 is not None else None,
+            'k9_trend':         k9_trend,
+            'hist_reliability': hist_reliability,
+            'ip_per_start':     round(ip_per_start, 1),
+            'xfip':             xfip_val,
         }
 
         # Over row
@@ -376,12 +406,20 @@ def run():
         print('(Run scrapers/odds_api.py after ~9am ET on a game day for real props.)\n')
         props_df = make_synthetic_props(stats_df, savant_df)
 
+    # Load historical baselines (optional — degrades gracefully if missing)
+    baselines_path = os.path.join(HIST, 'player_baselines.csv')
+    baselines_df   = pd.read_csv(baselines_path) if os.path.exists(baselines_path) else None
+    if baselines_df is not None:
+        print(f'Historical baselines loaded: {len(baselines_df)} pitchers (2024-2025)')
+    else:
+        print('No historical baselines found — run scrapers/historical_stats.py and models/player_baseline.py')
+
     print(f'Pitchers in FanGraphs stats: {len(stats_df)}')
     print(f'Pitchers in Statcast data:   {len(savant_df)}')
     print(f'Prop lines to evaluate:      {len(props_df)}')
 
     bankroll = 1000.0
-    signals  = build_ev_signals(props_df, savant_df, stats_df, bankroll)
+    signals  = build_ev_signals(props_df, savant_df, stats_df, bankroll, baselines_df)
 
     if signals.empty:
         print('\nNo signals generated — check that pitcher names match across files.')
