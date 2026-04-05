@@ -326,9 +326,24 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
     xfip_str = f'{float(xfip):.2f}' if xfip is not None and not pd.isna(xfip) else 'N/A'
     ip_str   = f'{float(ip_per_start):.1f}' if ip_per_start is not None and not pd.isna(ip_per_start) else 'N/A'
 
+    opp_k_pct      = signal.get('opp_k_pct')
+    matchup_factor = signal.get('matchup_factor')
+    opp_team       = signal.get('opp_team')
+
+    if opp_k_pct is not None and not pd.isna(opp_k_pct) and matchup_factor is not None:
+        factor_f  = float(matchup_factor)
+        arrow     = '▲' if factor_f > 1.02 else ('▼' if factor_f < 0.98 else '—')
+        opp_k_str = f'{float(opp_k_pct):.1%}  {arrow}  {factor_f:.2f}x'
+    else:
+        opp_k_str = 'N/A'
+
     embed.add_embed_field(name='xFIP (season)', value=xfip_str,    inline=True)
     embed.add_embed_field(name='IP/Start',      value=ip_str,      inline=True)
     embed.add_embed_field(name='Matchup',       value=matchup_str, inline=True)
+
+    embed.add_embed_field(name='Opp K-Rate', value=opp_k_str, inline=True)
+    embed.add_embed_field(name='Opp Team',   value=str(opp_team) if opp_team else 'N/A', inline=True)
+    embed.add_embed_field(name='\u200b',     value='\u200b',   inline=True)  # spacer
 
     # Row 5 — plain-English rationale
     summary = generate_summary(signal)

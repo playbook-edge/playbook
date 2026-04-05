@@ -60,6 +60,7 @@ def get_todays_starters():
                         'name':   pitcher.get('fullName', ''),
                         'team':   team,
                         'mlb_id': pitcher.get('id'),
+                        'throws': pitcher.get('pitchHand', {}).get('code', 'R'),
                     })
 
     print(f"  Found {len(starters)} probable starters.")
@@ -191,12 +192,13 @@ def run():
         sc_data = fetch_pitcher_statcast(p['mlb_id'], p['name'])
         metrics = compute_metrics(sc_data)
         rows.append({
-            'name':  p['name'],
-            'team':  p['team'],
-            'k_pct': metrics['k_pct'],
-            'xfip':  lookup_xfip(p['name']),
-            'velo':  metrics['velo'],
-            'babip': metrics['babip'],
+            'name':   p['name'],
+            'team':   p['team'],
+            'throws': p.get('throws', 'R'),
+            'k_pct':  metrics['k_pct'],
+            'xfip':   lookup_xfip(p['name']),
+            'velo':   metrics['velo'],
+            'babip':  metrics['babip'],
         })
 
     report = pd.DataFrame(rows)

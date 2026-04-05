@@ -31,6 +31,43 @@ EV_THRESHOLD = 0.04   # flag anything above 4% EV
 MIN_EV_KELLY = 0.01   # don't recommend a stake below 1% EV
 MAX_KELLY    = 0.05   # cap stake at 5% of bankroll (half-Kelly safety)
 
+# ── Batter matchup: team name → team_krates.csv code ──────────
+# team_krates uses Statcast abbreviations; pitcher_stats uses FanGraphs.
+# This mapping handles full names, short names, city names, and both
+# abbreviation formats so we can always find the right row.
+TEAM_CODES = {
+    # Direct passthrough (already in team_krates format)
+    'ath': 'ATH', 'atl': 'ATL', 'az': 'AZ',  'bal': 'BAL', 'bos': 'BOS',
+    'chc': 'CHC', 'cin': 'CIN', 'cle': 'CLE', 'col': 'COL', 'cws': 'CWS',
+    'det': 'DET', 'hou': 'HOU', 'kc':  'KC',  'laa': 'LAA', 'lad': 'LAD',
+    'mia': 'MIA', 'mil': 'MIL', 'min': 'MIN', 'nym': 'NYM', 'nyy': 'NYY',
+    'phi': 'PHI', 'pit': 'PIT', 'sd':  'SD',  'sea': 'SEA', 'sf':  'SF',
+    'stl': 'STL', 'tb':  'TB',  'tex': 'TEX', 'tor': 'TOR', 'wsh': 'WSH',
+    # FanGraphs abbreviations that differ from Statcast
+    'ari': 'AZ', 'oak': 'ATH', 'was': 'WSH', 'tam': 'TB',
+    # Team nicknames (from matchup strings like "Cardinals @ Tigers")
+    'diamondbacks': 'AZ',   'braves': 'ATL',    'orioles': 'BAL',
+    'red sox': 'BOS',       'cubs': 'CHC',      'white sox': 'CWS',
+    'reds': 'CIN',          'guardians': 'CLE', 'rockies': 'COL',
+    'tigers': 'DET',        'astros': 'HOU',    'royals': 'KC',
+    'angels': 'LAA',        'dodgers': 'LAD',   'marlins': 'MIA',
+    'brewers': 'MIL',       'twins': 'MIN',     'mets': 'NYM',
+    'yankees': 'NYY',       'athletics': 'ATH', 'phillies': 'PHI',
+    'pirates': 'PIT',       'padres': 'SD',     'giants': 'SF',
+    'mariners': 'SEA',      'cardinals': 'STL', 'rays': 'TB',
+    'rangers': 'TEX',       'blue jays': 'TOR', 'nationals': 'WSH',
+    # City names
+    'arizona': 'AZ',   'atlanta': 'ATL',   'baltimore': 'BAL',
+    'boston': 'BOS',   'chicago': None,    'cincinnati': 'CIN',
+    'cleveland': 'CLE','colorado': 'COL',  'detroit': 'DET',
+    'houston': 'HOU',  'kansas city': 'KC','los angeles': None,
+    'miami': 'MIA',    'milwaukee': 'MIL', 'minnesota': 'MIN',
+    'new york': None,  'oakland': 'ATH',   'philadelphia': 'PHI',
+    'pittsburgh': 'PIT','san diego': 'SD', 'san francisco': 'SF',
+    'seattle': 'SEA',  'st. louis': 'STL', 'tampa bay': 'TB',
+    'texas': 'TEX',    'toronto': 'TOR',   'washington': 'WSH',
+}
+
 
 # ============================================================
 # LAYER 1 — Pure math functions
@@ -222,11 +259,75 @@ def match_name(target: str, candidates: pd.Series) -> str | None:
     return None
 
 
+def team_name_to_code(name: str) -> str | None:
+    """
+    Convert any team name/abbreviation to the 3-letter code used in team_krates.csv.
+    Tries the full string first, then each word individually as a fallback.
+    Returns None if no match found.
+    """
+    key = name.lower().strip()
+    if key in TEAM_CODES:
+        return TEAM_CODES[key]
+    # Try each word (catches "Tigers" from "Detroit Tigers")
+    for word in key.split():
+        if word in TEAM_CODES and TEAM_CODES[word] is not None:
+            return TEAM_CODES[word]
+    return None
+
+
+def lookup_opp_krate(pitcher_team: str, matchup: str,
+                     throws: str, krates_df: pd.DataFrame) -> tuple:
+    """
+    Given a pitcher's team, the matchup string, and the pitcher's throwing hand,
+    return (opp_team_code, opp_k_pct, matchup_factor).
+
+    matchup_factor = opp_k_pct / league_avg_k_pct
+      > 1.0  →  strikeout-prone lineup  →  bump expected Ks up
+      < 1.0  →  hard-to-strikeout lineup →  trim expected Ks down
+      = 1.0  →  no data available, no adjustment
+
+    Example: opp K% = 0.270, league avg = 0.225 → factor = 1.20
+    """
+    if krates_df is None or not matchup:
+        return None, None, 1.0
+
+    # Normalise pitcher's team to krates format
+    pitcher_code = team_name_to_code(pitcher_team) or pitcher_team.upper()
+
+    # Parse "Cardinals @ Tigers" → away='Cardinals', home='Tigers'
+    parts = str(matchup).replace(' @ ', '|').split('|')
+    if len(parts) != 2:
+        return None, None, 1.0
+
+    away_code = team_name_to_code(parts[0].strip())
+    home_code = team_name_to_code(parts[1].strip())
+
+    # Opposing team = whichever side doesn't match the pitcher's team
+    if away_code and away_code != pitcher_code:
+        opp_code = away_code
+    elif home_code and home_code != pitcher_code:
+        opp_code = home_code
+    else:
+        return None, None, 1.0
+
+    col = 'vs_RHP' if str(throws).upper() == 'R' else 'vs_LHP'
+    row = krates_df[krates_df['team'] == opp_code]
+    if row.empty or pd.isna(row.iloc[0].get(col)):
+        return opp_code, None, 1.0
+
+    opp_k_pct   = float(row.iloc[0][col])
+    league_avg  = float(krates_df[col].mean())
+    factor      = round(opp_k_pct / league_avg, 3) if league_avg > 0 else 1.0
+
+    return opp_code, round(opp_k_pct, 3), factor
+
+
 def build_ev_signals(props_df:    pd.DataFrame,
                      savant_df:   pd.DataFrame,
                      stats_df:    pd.DataFrame,
                      bankroll:    float = 1000.0,
-                     baselines_df: pd.DataFrame | None = None) -> pd.DataFrame:
+                     baselines_df: pd.DataFrame | None = None,
+                     krates_df:   pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Core matching and EV calculation.
 
@@ -293,6 +394,36 @@ def build_ev_signals(props_df:    pd.DataFrame,
 
         prop_type = str(prop.get('prop_type', 'pitcher_strikeouts'))
 
+        # ── Batter matchup context ────────────────────────────
+        # Look up the opposing lineup's K-rate vs this pitcher's hand.
+        # A strikeout-prone lineup boosts expected Ks; a contact lineup lowers them.
+        # Only applies to strikeout props (innings props are unaffected by K-rate).
+        opp_team       = None
+        opp_k_pct      = None
+        matchup_factor = 1.0
+
+        if krates_df is not None and prop_type != 'pitcher_innings':
+            # Pitcher handedness from savant_df (defaults to R if not found)
+            sv_lookup = match_name(player, savant_df['name'])
+            throws = 'R'
+            if sv_lookup:
+                sv_row = savant_df[savant_df['name'] == sv_lookup].iloc[0]
+                t = sv_row.get('throws')
+                if t and pd.notna(t):
+                    throws = str(t)
+
+            # Pitcher's team code from stats_df
+            pitcher_team = ''
+            if stats_name:
+                pitcher_team = str(stats_df[stats_df['name'] == stats_name].iloc[0].get('team', ''))
+
+            opp_team, opp_k_pct, matchup_factor = lookup_opp_krate(
+                pitcher_team, str(prop.get('matchup', '')), throws, krates_df
+            )
+
+        # Apply matchup factor: scale K/9 up/down based on opposing lineup
+        adjusted_k9 = blended_k9 * matchup_factor
+
         # ── Route to the correct probability model ────────────
         if prop_type == 'pitcher_innings':
             # Normal distribution around historical avg IP/start
@@ -301,7 +432,7 @@ def build_ev_signals(props_df:    pd.DataFrame,
             expected_ks = None   # not applicable for innings props
         else:
             # Default: pitcher_strikeouts — Poisson model
-            expected_ks = estimate_expected_ks(blended_k9, ip_per_start)
+            expected_ks = estimate_expected_ks(adjusted_k9, ip_per_start)
             model_over  = prob_over_line(expected_ks, line)
             model_under = prob_under_line(expected_ks, line)
 
@@ -326,13 +457,16 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'book':             prop.get('book', ''),
             'line':             line,
             'expected_ks':      round(expected_ks, 2) if expected_ks is not None else None,
-            'k9_used':          round(blended_k9, 2),
+            'k9_used':          round(adjusted_k9, 2),
             'k9_current':       round(k9, 2),
             'k9_historical':    round(hist_k9, 2) if hist_k9 is not None else None,
             'k9_trend':         k9_trend,
             'hist_reliability': hist_reliability,
             'ip_per_start':     round(ip_per_start, 1),
             'xfip':             xfip_val,
+            'opp_team':         opp_team,
+            'opp_k_pct':        opp_k_pct,
+            'matchup_factor':   matchup_factor,
         }
 
         # Over row
@@ -487,8 +621,16 @@ def run():
     print(f'Pitchers in Statcast data:   {len(savant_df)}')
     print(f'Prop lines to evaluate:      {len(props_df)}')
 
+    # Load team K-rates (optional — degrades gracefully if missing)
+    krates_path = os.path.join(RAW, 'team_krates.csv')
+    krates_df   = pd.read_csv(krates_path) if os.path.exists(krates_path) else None
+    if krates_df is not None:
+        print(f'Team K-rates loaded: {len(krates_df)} teams')
+    else:
+        print('No team K-rates found — run scrapers/fangraphs.py first')
+
     bankroll = 1000.0
-    signals  = build_ev_signals(props_df, savant_df, stats_df, bankroll, baselines_df)
+    signals  = build_ev_signals(props_df, savant_df, stats_df, bankroll, baselines_df, krates_df)
 
     if signals.empty:
         print('\nNo signals generated — check that pitcher names match across files.')
