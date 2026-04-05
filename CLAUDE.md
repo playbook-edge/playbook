@@ -10,8 +10,9 @@ Always read this before writing any code or making suggestions.
 **Playbook** is a baseball betting intelligence platform (brand: playbook.edge).
 The goal is to automate the process of finding edges in MLB betting markets by:
 1. Scraping live odds and Statcast/FanGraphs pitcher/batter data
-2. Running statistical models to identify mispriced lines
-3. Sending alerts to Discord when a high-confidence edge is found
+2. Comparing current performance against 2-year historical baselines
+3. Running a Poisson-based model to identify mispriced strikeout props
+4. Sending tier-badged alerts to Discord when a high-confidence edge is found
 
 The owner has no coding experience. Keep all explanations simple and jargon-free.
 
@@ -30,85 +31,174 @@ The owner has no coding experience. Keep all explanations simple and jargon-free
 ```
 playbook/
 ├── data/
-│   ├── raw/          # Raw data exactly as pulled — never modify these
-│   ├── processed/    # Cleaned, analysis-ready versions of raw data
-│   └── historical/   # Past game results for backtesting
-├── models/           # Edge calculators and prediction logic (not built yet)
-├── scrapers/         # Data-pulling scripts
-├── alerts/           # Discord notification logic (not built yet)
-├── logs/             # Runtime logs (not built yet)
-├── research/         # Notes, experiments, one-off analysis
-├── config.py         # All settings loaded from .env
-├── main.py           # Entry point — will eventually run the full bot
-└── requirements.txt  # All dependencies
+│   ├── raw/              # Fresh data pulled each run — never modify manually
+│   ├── processed/        # Model outputs (ev_signals.csv)
+│   └── historical/       # 2024-2025 season stats + player baselines
+├── models/               # EV calculator and player baseline builder
+├── scrapers/             # Data-pulling scripts
+├── alerts/               # Discord notification logic
+├── logs/                 # Daily pipeline logs (pipeline_YYYY-MM-DD.log)
+├── research/             # Notes, experiments, one-off analysis
+├── config.py             # All settings loaded from .env
+├── main.py               # Full pipeline — runs all 6 steps in order
+├── run_playbook.bat      # Double-click or schedule via Task Scheduler
+├── requirements.txt      # All dependencies
+├── .env.example          # Template — copy to .env and fill in keys
+└── .gitignore            # Keeps .env and data files off GitHub
 ```
+
+---
+
+## Full Pipeline (main.py — 6 steps)
+
+Run manually: `python main.py`
+Scheduled via: Windows Task Scheduler pointing at `run_playbook.bat` (set to 10:30am daily)
+
+```
+Step 1  scrapers/baseball_savant.py   →  data/raw/savant_today.csv
+Step 2  scrapers/fangraphs.py         →  data/raw/pitcher_stats.csv
+                                          data/raw/team_krates.csv
+Step 3  scrapers/historical_stats.py  →  data/historical/pitcher_stats_2024.csv
+                                          data/historical/pitcher_stats_2025.csv
+                                          data/historical/pitcher_stats_all.csv
+Step 4  models/player_baseline.py     →  data/historical/player_baselines.csv
+Step 5  scrapers/odds_api.py          →  data/raw/todays_props.csv
+Step 6  models/ev_calculator.py       →  data/processed/ev_signals.csv
+                                          → fires Discord alerts automatically
+```
+
+Each step is isolated — one failure doesn't stop the rest.
+A pipeline summary embed is also sent to Discord after all steps complete.
 
 ---
 
 ## What Has Been Built
 
 ### `scrapers/baseball_savant.py` — WORKING
-Pulls today's MLB probable starters and their last-30-day Statcast stats.
+- Fetches today's probable starters from the free MLB Stats API (no key needed)
+- For each pitcher: calls `pybaseball.statcast_pitcher()` for last-30-day pitch data
+- Computes K%, fastball velocity, BABIP from raw Statcast rows
+- Tries FanGraphs xFIP via `pitching_stats_range()` — fails early in season (empty table), xFIP shows None until ~mid-April
+- 5-second delay between requests; pybaseball cache enabled
+- **Known quirk**: accented names (e.g. Vásquez) print garbled in Windows terminal — data in CSV is correct
 
-**How it works:**
-- Fetches today's schedule from the free MLB Stats API (no key needed)
-- For each pitcher, calls `pybaseball.statcast_pitcher()` to get pitch-by-pitch data
-- Computes K%, fastball velocity, and BABIP from raw Statcast rows
-- Tries to fetch xFIP from FanGraphs via `pybaseball.pitching_stats_range()` — this fails early in the season when FanGraphs has no qualifying table yet, so xFIP shows as None until ~mid-April
-- Saves output to `data/raw/savant_today.csv`
-- Uses a 5-second delay between requests to avoid rate limiting
-- pybaseball cache is enabled — re-runs within the same day are instant
+### `scrapers/fangraphs.py` — WORKING
+- Team strikeout rates by batter handedness (vs RHP / vs LHP) from Statcast
+- Current season pitching leaderboard: xFIP, FIP, K/9, BB/9, BABIP
+- Batting team derived from `home_team`/`away_team` + `inning_topbot` (no direct column)
 
-**Run it:**
-```
-python scrapers/baseball_savant.py
-```
+### `scrapers/historical_stats.py` — WORKING
+- Pulls full 2024 and 2025 FanGraphs season stats via `pitching_stats(year, year, qual=0)`
+- Skips re-fetch if file already exists (cached to disk)
+- Saves per-year CSVs + combined `pitcher_stats_all.csv`
+- Run once to seed; re-run at end of each season to add the new year
 
-**Output columns:** `name, team, k_pct, xfip, velo, babip`
+### `scrapers/odds_api.py` — WORKING (needs API key)
+- Fetches today's MLB events, then per-event pitcher strikeout props
+- Books: DraftKings, FanDuel, BetMGM
+- Requires `ODDS_API_KEY` in `.env` (the-odds-api.com — free tier: 500 req/month)
+- Props post around 9-10am ET on game days; empty file before then is normal
+- Logs remaining API quota on each run
 
-**Known limitations:**
-- xFIP is None early in the season (FanGraphs table is empty until enough PA accumulate)
-- Pitchers with zero appearances in the 30-day window show NaN for all stats
-- Some accented/special characters in pitcher names print as garbled on Windows terminal — the data in the CSV is correct
+### `models/player_baseline.py` — WORKING
+- Builds per-pitcher historical composites from 2024+2025 data
+- **2-year weighted averages**: recent year (2025) weighted 2x over 2024
+- **Reliability Score (0-100)**: based on total IP, seasons of data, K/9 consistency, xFIP consistency
+- **Trend arrows**: UP / DOWN / STABLE / NEW — compares current season to historical average
+- Uses fuzzy name matching (SequenceMatcher) to handle minor spelling differences across sources
+- Output: 935 pitcher baselines as of April 2026
+
+### `models/ev_calculator.py` — WORKING
+- **Pure math layer**: American odds conversion, EV formula, Kelly Criterion (half-Kelly, capped 5%)
+- **Poisson model**: converts K/9 + expected IP into probability of going over/under any line
+- **Historical blending**: blends current K/9 with historical baseline
+  - High-reliability pitchers (90+): ~50% historical, ~50% current
+  - Low-reliability/new pitchers: ~70% current, ~30% historical
+  - This prevents small-sample flukes from dominating signals
+- **Synthetic props fallback**: when no live props exist, generates lines from K/9 for testing
+- Flags any prop above 4% EV; saves full results to `ev_signals.csv`
+
+### `alerts/discord_alerts.py` — WORKING
+- Sends formatted Discord embed with: player, prop, odds, EV%, model vs implied prob, Kelly stake, game time, tier badge
+- **PlaybookIQ score (0-100)**: composite of EV (40pts) + edge (30pts) + xFIP quality (20pts) + sample size (10pts)
+- **Tier badges by EV**: Conservative 4-7% (green), Moderate 7-12% (yellow), Aggressive 12-20% (red), Degen 20%+ (purple)
+- Embed now shows: K/9 vs History field with trend arrow, Data Reliability score, Blended K/9 used
+- Game time looked up live from MLB Stats API
+- Webhook URL: `DISCORD_WEBHOOK_CONSERVATIVE` in `.env`
+- `fire_alerts_from_signals()` caps at 5 alerts per run to avoid spam
+
+---
+
+## Key Data Files
+
+| File | Updated | Contents |
+|------|---------|----------|
+| `data/raw/savant_today.csv` | Daily | Today's starters: k_pct, velo, babip |
+| `data/raw/pitcher_stats.csv` | Daily | Season leaderboard: k9, xfip, fip, babip |
+| `data/raw/team_krates.csv` | Daily | Team K% vs RHP and LHP |
+| `data/raw/todays_props.csv` | Daily | Live prop lines from books |
+| `data/historical/pitcher_stats_2024.csv` | Once/year | Full 2024 FanGraphs season |
+| `data/historical/pitcher_stats_2025.csv` | Once/year | Full 2025 FanGraphs season |
+| `data/historical/player_baselines.csv` | Daily | 935 pitcher baselines with trends |
+| `data/processed/ev_signals.csv` | Daily | All EV calculations + flags |
+
+---
+
+## Environment Variables (.env)
+
+| Key | Used by | Status |
+|-----|---------|--------|
+| `ODDS_API_KEY` | odds_api.py | Set |
+| `DISCORD_WEBHOOK_CONSERVATIVE` | discord_alerts.py | Set |
+| `ANTHROPIC_API_KEY` | (future) Claude analysis | Not set |
+| `SUPABASE_URL` + `SUPABASE_KEY` | (future) database | Not set |
 
 ---
 
 ## Dependencies (all installed)
 
 | Package | Purpose |
-|---|---|
+|---------|---------|
 | `pybaseball` | Statcast + FanGraphs data |
-| `anthropic` | Claude AI for analysis |
-| `requests` | HTTP calls to MLB Stats API and other sources |
+| `anthropic` | Claude AI for analysis (not wired in yet) |
+| `requests` | HTTP calls to MLB Stats API and Odds API |
 | `supabase` | Database (not connected yet) |
-| `apscheduler` | Scheduling the bot to run automatically (not set up yet) |
-| `python-dotenv` | Loads `.env` into environment |
-| `discord-webhook` | Sends alerts to Discord (not set up yet) |
+| `apscheduler` | Scheduling (replaced by Task Scheduler — not used) |
+| `python-dotenv` | Loads `.env` |
+| `discord-webhook` | Sends alerts to Discord |
 | `pandas` | Data wrangling |
 | `numpy` | Math |
+| `scipy` | Poisson distribution for K probability model |
 
 ---
 
-## Environment Variables
+## Model Logic (important to understand)
 
-See `.env.example` for the full list. Keys needed:
-- `ANTHROPIC_API_KEY` — for AI analysis
-- `SUPABASE_URL` + `SUPABASE_KEY` — for the database
-- `DISCORD_WEBHOOK_URL` — for bet alerts
-- `ODDS_API_KEY` — for live odds (the-odds-api.com)
+**Why Poisson?** Strikeouts are a count event. Poisson distribution is the correct
+model for "how many times does X happen in Y opportunities."
 
-Real values go in `.env` (gitignored — never committed).
+**Why blend historical K/9?** Early-season K/9 is noisy (small sample). A pitcher with
+2 years of 9.0 K/9 who has 11.0 in 2 starts is probably not suddenly elite —
+blending pulls the estimate back toward what we actually know about them.
+
+**EV formula**: `(model_prob × payout) - (1 - model_prob)`
+Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-40%
+(synthetic data has inflated edges because lines are set at expected value).
+
+**What the system caught with history**: Kyle Leahy and Zac Gallen were the top
+synthetic signals (47%, 39% EV) but both are DOWN 5+ K/9 vs their historical average.
+Historical blending correctly downweighted them. The new top signals (Hancock, Irvin,
+Boyd) are all pitchers tracking UP vs history — a much stronger foundation.
 
 ---
 
 ## What to Build Next (rough order)
 
-1. **Odds scraper** — pull today's MLB moneylines and totals from the Odds API
-2. **Edge calculator** — compare model-implied probability to the market line
-3. **Claude analysis** — prompt Claude to rate each game given pitcher stats + odds
-4. **Discord alerts** — send formatted alert when edge exceeds threshold
-5. **Scheduler** — run the full pipeline automatically each morning
-6. **Supabase logging** — store results and track bet outcomes over time
+1. **Batter matchup context** — add opposing team K-rate (from team_krates.csv) into the prop signal
+2. **Claude AI analysis** — prompt Claude with the full signal context, get a plain-English write-up
+3. **Supabase logging** — store signals and track bet outcomes over time
+4. **Result tracking** — after each game, record whether the prop hit and update a P&L log
+5. **Batter props** — expand beyond pitchers to hit/HR/RBI props
 
 ---
 
@@ -120,3 +210,4 @@ Real values go in `.env` (gitignored — never committed).
 - Keep scrapers gentle on rate limits (5-second delays minimum)
 - Save all raw data to `data/raw/` before any processing
 - Prefer simple, readable code over clever one-liners
+- After every session, update this file and push to GitHub
