@@ -48,36 +48,6 @@ class Logger:
 
 
 # ─────────────────────────────────────────────────────────────
-# Discord summary message (pipeline complete notification)
-# ─────────────────────────────────────────────────────────────
-
-def send_pipeline_summary(logger, results: dict):
-    try:
-        from discord_webhook import DiscordWebhook, DiscordEmbed
-
-        url = config.DISCORD_WEBHOOK_CONSERVATIVE
-        if not url:
-            return
-
-        hook  = DiscordWebhook(url=url, rate_limit_retry=True)
-        embed = DiscordEmbed(color=0x3498DB)
-
-        status_lines = []
-        for step, info in results.items():
-            icon = 'OK' if info['ok'] else 'FAIL'
-            status_lines.append(f'[{icon}]  {step}  —  {info["note"]}')
-
-        embed.set_title('Playbook Pipeline Complete')
-        embed.set_description('```\n' + '\n'.join(status_lines) + '\n```')
-        embed.set_footer(text=f'Run at {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
-
-        hook.add_embed(embed)
-        hook.execute()
-    except Exception as e:
-        logger.log(f'  Pipeline summary failed: {e}')
-
-
-# ─────────────────────────────────────────────────────────────
 # Step runner — isolates each script so one failure doesn't
 #               stop the whole pipeline
 # ─────────────────────────────────────────────────────────────
@@ -146,23 +116,57 @@ def main():
     else:
         logger.log('Config OK')
 
-    results = {}
+    pipeline_start = time.time()
+    results        = {}
 
-    results['Baseball Savant'] = run_step(logger, 'Step 1/6  Baseball Savant',  step_savant)
-    results['FanGraphs']       = run_step(logger, 'Step 2/6  FanGraphs',         step_fangraphs)
-    results['Historical Stats']= run_step(logger, 'Step 3/6  Historical Stats',  step_historical)
-    results['Player Baselines']= run_step(logger, 'Step 4/6  Player Baselines',  step_baseline)
-    results['Odds API']        = run_step(logger, 'Step 5/6  Odds API',           step_odds)
-    results['EV Calculator']   = run_step(logger, 'Step 6/6  EV + Alerts',        step_ev)
+    steps = [
+        ('Baseball Savant',  'Step 1/6  Baseball Savant',  step_savant),
+        ('FanGraphs',        'Step 2/6  FanGraphs',        step_fangraphs),
+        ('Historical Stats', 'Step 3/6  Historical Stats', step_historical),
+        ('Player Baselines', 'Step 4/6  Player Baselines', step_baseline),
+        ('Odds API',         'Step 5/6  Odds API',         step_odds),
+        ('EV Calculator',    'Step 6/6  EV + Alerts',      step_ev),
+    ]
 
-    # Summary
+    for key, name, fn in steps:
+        result = run_step(logger, name, fn)
+        results[key] = result
+        if not result['ok']:
+            try:
+                from alerts.discord_alerts import send_error_alert
+                send_error_alert(key, result['note'])
+            except Exception as e:
+                logger.log(f'  Health error alert failed: {e}')
+
+    runtime = round(time.time() - pipeline_start)
+
+    # Count flagged signals from today's run
+    signal_count = 0
+    try:
+        import pandas as pd
+        signals_path = os.path.join(ROOT, 'data', 'processed', 'ev_signals.csv')
+        if os.path.exists(signals_path):
+            sig_df = pd.read_csv(signals_path)
+            signal_count = int(sig_df['flag'].sum()) if 'flag' in sig_df.columns else 0
+    except Exception:
+        pass
+
     passed = sum(1 for r in results.values() if r['ok'])
     logger.log('')
     logger.log(f'Pipeline finished: {passed}/6 steps passed')
     logger.log(f'Log saved to: {LOG_FILE}')
     logger.log('=' * 50)
 
-    send_pipeline_summary(logger, results)
+    # Send health summary (goes to DISCORD_WEBHOOK_HEALTH, not the bet channel)
+    results_str = {
+        k: v['note'] if v['ok'] else f'ERROR: {v["note"]}'
+        for k, v in results.items()
+    }
+    try:
+        from alerts.discord_alerts import send_pipeline_summary
+        send_pipeline_summary(results_str, runtime_seconds=runtime, signal_count=signal_count)
+    except Exception as e:
+        logger.log(f'  Health summary failed: {e}')
 
     # Log run to Supabase
     try:

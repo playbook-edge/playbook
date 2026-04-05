@@ -21,7 +21,7 @@ import pandas as pd
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from config import DISCORD_WEBHOOK_CONSERVATIVE
+from config import DISCORD_WEBHOOK_CONSERVATIVE, DISCORD_WEBHOOK_HEALTH
 
 # Tier definitions — (min_ev, label, color_hex, emoji)
 TIERS = [
@@ -448,6 +448,157 @@ def fire_alerts_from_signals(signals_df: pd.DataFrame,
     return sent
 
 
+# -----------------------------------------------
+# Health / operational alert functions
+# These send to DISCORD_WEBHOOK_HEALTH only --
+# never to the bet alert channels.
+# -----------------------------------------------
+
+def send_pipeline_summary(results: dict,
+                          runtime_seconds: int = None,
+                          signal_count: int = None):
+    """
+    Send a pipeline run summary to the health channel.
+
+    results: {step_name: str} — each value is either a plain success
+             string (e.g. 'completed in 12.3s') or an error string
+             starting with 'ERROR:' (e.g. 'ERROR: 401 Unauthorized').
+
+    Always prints a terminal preview. Sends to Discord only if
+    DISCORD_WEBHOOK_HEALTH is configured.
+    """
+    from discord_webhook import DiscordWebhook, DiscordEmbed
+
+    passed     = sum(1 for v in results.values() if not str(v).startswith('ERROR:'))
+    total      = len(results)
+    all_ok     = passed == total
+    color      = 0x2ECC71 if all_ok else 0xE74C3C
+    top_icon   = '✅' if all_ok else '⚠️'
+
+    runtime_str = (f'{runtime_seconds // 60}m {runtime_seconds % 60}s'
+                   if runtime_seconds is not None else 'N/A')
+    signals_str = str(signal_count) if signal_count is not None else 'N/A'
+
+    title = f'{top_icon}  Pipeline Complete — {passed}/{total} steps passed'
+
+    status_lines = []
+    for step, note in results.items():
+        icon = '❌' if str(note).startswith('ERROR:') else '✅'
+        status_lines.append(f'{icon}  {step}: {note}')
+
+    # Always print a preview to the terminal
+    term_lines = [
+        ('[OK] ' if not str(v).startswith('ERROR:') else '[FAIL] ') + f'{k}: {v}'
+        for k, v in results.items()
+    ]
+    print('\n' + '-' * 50)
+    print('  HEALTH EMBED PREVIEW -- send_pipeline_summary')
+    print('-' * 50)
+    print(f'  Title : Pipeline Complete -- {passed}/{total} steps passed')
+    for line in term_lines:
+        print(f'          {line}')
+    print(f'  Runtime        : {runtime_str}')
+    print(f'  Signals flagged: {signals_str}')
+    print(f'  Next run       : Tomorrow 10:30 AM ET')
+    print(f'  Timestamp      : {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
+    print('-' * 50 + '\n')
+
+    url = DISCORD_WEBHOOK_HEALTH
+    if not url:
+        print('  DISCORD_WEBHOOK_HEALTH not set — preview only, not sent.\n')
+        return
+
+    hook  = DiscordWebhook(url=url, rate_limit_retry=True)
+    embed = DiscordEmbed(title=title, color=color)
+    embed.set_description('```\n' + '\n'.join(status_lines) + '\n```')
+    embed.add_embed_field(name='Runtime',          value=runtime_str,          inline=True)
+    embed.add_embed_field(name='Signals flagged',  value=signals_str,          inline=True)
+    embed.add_embed_field(name='Next run',         value='Tomorrow 10:30 AM ET', inline=True)
+    embed.set_footer(text=f'Playbook Health  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
+    embed.set_timestamp()
+    hook.add_embed(embed)
+    hook.execute()
+
+
+def send_error_alert(step_name: str, error_message: str):
+    """
+    Send an immediate error alert to the health channel.
+    Called as soon as a pipeline step fails — pipeline continues afterward.
+
+    Always prints a terminal preview. Sends to Discord only if
+    DISCORD_WEBHOOK_HEALTH is configured.
+    """
+    from discord_webhook import DiscordWebhook, DiscordEmbed
+
+    title = f'🚨  Pipeline Error — {step_name}'
+
+    print('\n' + '-' * 50)
+    print('  HEALTH EMBED PREVIEW -- send_error_alert')
+    print('-' * 50)
+    print(f'  Title  : [ERROR] Pipeline Error -- {step_name}')
+    print(f'  Step   : {step_name}')
+    print(f'  Error  : {error_message}')
+    print(f'  Status : Pipeline continued')
+    print(f'  Time   : {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
+    print('-' * 50 + '\n')
+
+    url = DISCORD_WEBHOOK_HEALTH
+    if not url:
+        print('  DISCORD_WEBHOOK_HEALTH not set — preview only, not sent.\n')
+        return
+
+    hook  = DiscordWebhook(url=url, rate_limit_retry=True)
+    embed = DiscordEmbed(title=title, color=0xE74C3C)
+    embed.add_embed_field(name='Step',            value=step_name,                  inline=True)
+    embed.add_embed_field(name='Status',          value='Pipeline continued',       inline=True)
+    embed.add_embed_field(name='Error',
+                          value=f'```{error_message[:500]}```',
+                          inline=False)
+    embed.set_footer(text=f'Playbook Health  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
+    embed.set_timestamp()
+    hook.add_embed(embed)
+    hook.execute()
+
+
+def send_heartbeat(game_count: int, pending_trades: int):
+    """
+    Send a daily alive-check to the health channel.
+    Confirms the bot is running, how many games are on today,
+    and how many paper trades are still waiting for a result.
+
+    Always prints a terminal preview. Sends to Discord only if
+    DISCORD_WEBHOOK_HEALTH is configured.
+    """
+    from discord_webhook import DiscordWebhook, DiscordEmbed
+
+    title = '✅  Playbook is alive'
+
+    print('\n' + '-' * 50)
+    print('  HEALTH EMBED PREVIEW -- send_heartbeat')
+    print('-' * 50)
+    print(f'  Title          : [OK] Playbook is alive')
+    print(f'  Games today    : {game_count}')
+    print(f'  Pending trades : {pending_trades}')
+    print(f'  Next pipeline  : Tomorrow 10:30 AM ET')
+    print(f'  Time           : {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
+    print('-' * 50 + '\n')
+
+    url = DISCORD_WEBHOOK_HEALTH
+    if not url:
+        print('  DISCORD_WEBHOOK_HEALTH not set — preview only, not sent.\n')
+        return
+
+    hook  = DiscordWebhook(url=url, rate_limit_retry=True)
+    embed = DiscordEmbed(title=title, color=0x2ECC71)
+    embed.add_embed_field(name='Games today',    value=str(game_count),          inline=True)
+    embed.add_embed_field(name='Pending trades', value=str(pending_trades),      inline=True)
+    embed.add_embed_field(name='Next pipeline',  value='Tomorrow 10:30 AM ET',   inline=True)
+    embed.set_footer(text=f'Playbook Health  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
+    embed.set_timestamp()
+    hook.add_embed(embed)
+    hook.execute()
+
+
 # ─────────────────────────────────────────────
 # Standalone test / demo
 # ─────────────────────────────────────────────
@@ -485,4 +636,24 @@ def run():
 
 
 if __name__ == '__main__':
-    run()
+    print('Testing health alert functions (no webhook required)...\n')
+
+    send_pipeline_summary(
+        results={
+            'Baseball Savant':  'completed in 12.3s',
+            'FanGraphs':        'completed in 8.1s',
+            'Historical Stats': 'completed in 4.2s',
+            'Player Baselines': 'completed in 6.0s',
+            'Odds API':         'ERROR: 401 Unauthorized — check ODDS_API_KEY',
+            'EV Calculator':    'completed in 2.8s',
+        },
+        runtime_seconds=220,
+        signal_count=3,
+    )
+
+    send_error_alert(
+        step_name='Odds API',
+        error_message='401 Unauthorized — check ODDS_API_KEY in Railway env vars',
+    )
+
+    send_heartbeat(game_count=12, pending_trades=4)
