@@ -195,6 +195,28 @@ def get_pending_trades() -> list:
         return []
 
 
+def update_postpone_count(player: str, trade_date: str, side: str,
+                          line: float, new_count: int):
+    """
+    Set the postpone_count on a PENDING paper trade.
+    Called each time a game is found to be Postponed, Suspended, or Cancelled.
+    """
+    client = get_client()
+    if client is None:
+        return
+    try:
+        (client.table('paper_trades')
+               .update({'postpone_count': new_count})
+               .eq('player', player)
+               .eq('side', side)
+               .eq('line', float(line))
+               .eq('result', 'PENDING')
+               .gte('trade_date', str(trade_date)[:10])
+               .execute())
+    except Exception as e:
+        print(f'  Supabase postpone_count update error: {e}')
+
+
 def update_paper_trade_result(player: str, trade_date: str, side: str,
                                line: float, result: str,
                                payout: float, net: float):

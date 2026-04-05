@@ -25,16 +25,21 @@ from datetime import datetime
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from config import DISCORD_WEBHOOK_PAPER, BANKROLL, ODDS_API_KEY
+from config import DISCORD_WEBHOOK_PAPER, DISCORD_WEBHOOK_HEALTH, BANKROLL, ODDS_API_KEY
 
-TRADES_PATH     = os.path.join(os.path.dirname(__file__), '..', 'data', 'processed', 'paper_trades.csv')
+TRADES_PATH       = os.path.join(os.path.dirname(__file__), '..', 'data', 'processed', 'paper_trades.csv')
 STARTING_BANKROLL = float(BANKROLL) if BANKROLL else 1000.0
 
 TRADE_COLUMNS = [
     'date', 'player', 'prop_type', 'side', 'line', 'odds',
     'ev', 'stake', 'bankroll_before', 'bankroll_after',
-    'result', 'payout', 'net', 'matchup', 'book'
+    'result', 'payout', 'net', 'matchup', 'book', 'postpone_count'
 ]
+
+# Game states that block resolution (bet stays PENDING)
+POSTPONE_STATES    = {'Postponed', 'Suspended', 'Cancelled'}
+IN_PROGRESS_STATES = {'In Progress', 'Manager Challenge', 'Replay'}
+POSTPONE_ALERT_AT  = 3   # send health alert after this many postponements
 
 
 # ─────────────────────────────────────────────
@@ -117,6 +122,10 @@ def _load_trades() -> pd.DataFrame:
     for col in ['stake', 'bankroll_before', 'bankroll_after', 'payout', 'net', 'ev']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(float)
+    # Handle postpone_count missing in older CSVs
+    if 'postpone_count' not in df.columns:
+        df['postpone_count'] = 0
+    df['postpone_count'] = pd.to_numeric(df['postpone_count'], errors='coerce').fillna(0).astype(int)
     return df
 
 
@@ -290,6 +299,7 @@ def log_bets_from_signals(signals_df: pd.DataFrame,
             'net':             0.0,
             'matchup':         row.get('matchup', ''),
             'book':            row.get('book', ''),
+            'postpone_count':  0,
         }
 
         _save_trade(trade)
@@ -326,15 +336,110 @@ def _normalize(name: str) -> str:
     return name.strip()
 
 
+def _fetch_game_statuses(date: str) -> dict:
+    """
+    Pull the MLB schedule for `date` and return a game status dict keyed by
+    normalized probable pitcher name.
+
+    Returns:
+        { normalized_pitcher_name: {'state': str, 'detail': str, 'gamePk': int} }
+
+    state is one of:
+        'Final'       — game over, safe to resolve
+        'In Progress' — game live, leave PENDING
+        'Postponed'   — game postponed, increment postpone_count
+        'Suspended'   — game suspended mid-play, increment postpone_count
+        'Cancelled'   — game cancelled, increment postpone_count
+        'Preview'     — not yet started, leave PENDING
+    """
+    statuses = {}
+    try:
+        url  = (
+            f'https://statsapi.mlb.com/api/v1/schedule'
+            f'?sportId=1&date={date}&hydrate=probablePitcher(note)'
+        )
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        games = resp.json().get('dates', [{}])[0].get('games', [])
+
+        for game in games:
+            s        = game.get('status', {})
+            abstract = s.get('abstractGameState', '')
+            detail   = s.get('detailedState', '')
+            game_pk  = game.get('gamePk')
+
+            if detail in POSTPONE_STATES:
+                state = detail                       # 'Postponed', 'Suspended', 'Cancelled'
+            elif abstract == 'Final':
+                state = 'Final'
+            elif abstract == 'Live':
+                state = 'In Progress'
+            else:
+                state = 'Preview'
+
+            for side in ('home', 'away'):
+                pitcher = game['teams'][side].get('probablePitcher')
+                if pitcher:
+                    norm = _normalize(pitcher.get('fullName', ''))
+                    if norm:
+                        statuses[norm] = {'state': state, 'detail': detail, 'gamePk': game_pk}
+
+    except Exception as e:
+        print(f'  Warning: could not fetch game statuses for {date}: {e}')
+
+    return statuses
+
+
+def _send_postpone_alert(player: str, side: str, line: float,
+                         count: int, state: str):
+    """
+    Fire a health-channel alert when a bet has been postponed POSTPONE_ALERT_AT
+    times and needs manual review.
+    """
+    from discord_webhook import DiscordWebhook, DiscordEmbed
+
+    url = DISCORD_WEBHOOK_HEALTH
+    if not url:
+        print(f'  DISCORD_WEBHOOK_HEALTH not set — skipping postpone alert for {player}')
+        return
+
+    embed = DiscordEmbed(color=0xF39C12)   # orange
+    embed.set_author(name='PAPER TRADE — MANUAL REVIEW NEEDED')
+    embed.set_title(f'{player}  —  {side} {line}')
+    embed.set_description(
+        f'This bet has been **{state}** {count} times and cannot auto-resolve.\n'
+        f'Please review and mark manually: `python alerts/paper_trading.py resolve`'
+    )
+    embed.set_timestamp()
+
+    hook = DiscordWebhook(url=url, rate_limit_retry=True)
+    hook.add_embed(embed)
+    try:
+        hook.execute()
+        print(f'  Health alert sent: {player} postponed {count}x')
+    except Exception as e:
+        print(f'  Postpone alert error: {e}')
+
+
 def _fetch_pitcher_results(date: str) -> dict:
     """
-    Hit the MLB Stats API and return actual results for every starting pitcher
-    whose game is Final on the given date.
+    Fetch the starting pitcher's personal stat line from the MLB boxscore API
+    for every Final game on `date`.
 
-    Returns: { normalized_name: {'ks': int, 'ip': float} }
+    ATTRIBUTION NOTE: `pitchers[0]` in the boxscore is always the first pitcher
+    who appeared (the starter in a normal game).  The stats we pull come from
+    that individual player's line — sp.stats.pitching.strikeOuts — which is
+    the pitcher's own K total, NOT the team's combined pitching total.
+    This ensures a bet on "Skenes Over 6.5 Ks" resolves against Skenes's
+    strikeouts only, even if the bullpen added more afterward.
 
-    IP is converted from MLB's "outs" format (e.g. '6.2' = 6 2/3 innings = 6.667)
-    so it can be directly compared against a prop line like 5.5.
+    Returns: { normalized_starter_name: {'ks': int, 'ip': float} }
+
+    IP is converted from MLB's "outs" format: '6.2' = 6 full innings + 2 outs
+    = 6.667 decimal innings, comparable directly to a prop line of 5.5 or 6.0.
+
+    Only Final games are processed — game status routing is handled upstream
+    in auto_resolve via _fetch_game_statuses().
     """
     results = {}
     try:
@@ -347,7 +452,7 @@ def _fetch_pitcher_results(date: str) -> dict:
 
         for game in games:
             if game.get('status', {}).get('abstractGameState') != 'Final':
-                continue  # game not finished yet — skip
+                continue  # non-Final games handled by _fetch_game_statuses
 
             gid = game['gamePk']
             try:
@@ -362,14 +467,15 @@ def _fetch_pitcher_results(date: str) -> dict:
                     if not pitchers:
                         continue
 
+                    # pitchers[0] = the first pitcher who took the mound (the starter).
+                    # We read from sp.stats.pitching — this is the individual's line,
+                    # not the team total.
                     sp_id    = f'ID{pitchers[0]}'
                     sp       = players.get(sp_id, {})
                     name     = sp.get('person', {}).get('fullName', '')
                     pitching = sp.get('stats', {}).get('pitching', {})
-                    ks       = pitching.get('strikeOuts')
+                    ks       = pitching.get('strikeOuts')   # starter's Ks only
 
-                    # Convert MLB innings string: '6.2' means 6 full innings + 2 outs
-                    # = 6 + 2/3 = 6.667 real innings
                     ip = None
                     ip_str = str(pitching.get('inningsPitched', ''))
                     if ip_str:
@@ -500,14 +606,21 @@ def auto_resolve():
             print(f'  Heartbeat error: {e}')
         return
 
-    print(f'\nFetching box scores...\n')
+    print(f'\nFetching game statuses and box scores...\n')
 
-    # Fetch box scores for every unique bet date
-    dates = list({str(r[date_key])[:10] for r in pending_rows})
-    box_scores = {}
+    # Fetch game statuses AND box score results for every unique bet date.
+    # Status check runs first so we can route each bet correctly before
+    # attempting any resolution.
+    dates        = list({str(r[date_key])[:10] for r in pending_rows})
+    game_statuses = {}
+    box_scores    = {}
     for date in dates:
-        box_scores[date] = _fetch_pitcher_results(date)
-        print(f'  {date}: box scores for {len(box_scores[date])} starting pitchers')
+        game_statuses[date] = _fetch_game_statuses(date)
+        box_scores[date]    = _fetch_pitcher_results(date)
+        status_summary = ', '.join(
+            f'{s["state"]}' for s in game_statuses[date].values()
+        ) or 'none found'
+        print(f'  {date}: {len(box_scores[date])} Final, statuses: [{status_summary}]')
 
     # Fetch closing odds once — a single batch call before the resolve loop.
     # At 11:30 PM most games have already started so the API typically returns
@@ -534,6 +647,71 @@ def auto_resolve():
         odds      = float(row['odds'])
         book      = str(row.get('book', ''))
 
+        # ── Step 1: Check game status before attempting resolution ───────────
+        player_norm = _normalize(player)
+        game_info   = game_statuses.get(date_val, {}).get(player_norm)
+
+        # Last-name fallback for the status dict (same pattern as _match_pitcher)
+        if game_info is None:
+            last = player_norm.split()[-1] if player_norm else ''
+            matches = {k: v for k, v in game_statuses.get(date_val, {}).items()
+                       if k.split()[-1] == last}
+            if len(matches) == 1:
+                game_info = list(matches.values())[0]
+
+        game_state = game_info['state'] if game_info else None
+
+        # ── In Progress: game is live, leave PENDING and skip ───────────────
+        if game_state in IN_PROGRESS_STATES:
+            print(f'  LIVE  {player:<24} — game in progress, leaving PENDING')
+            skipped.append(player)
+            continue
+
+        # ── Postponed / Suspended / Cancelled: increment counter ────────────
+        if game_state in POSTPONE_STATES:
+            current_count = int(row.get('postpone_count', 0))
+            new_count     = current_count + 1
+            detail        = game_info['detail'] if game_info else game_state
+            print(f'  {game_state.upper():<11} {player:<24} — {detail} (postpone_count: {new_count})')
+
+            # Update CSV
+            if df is not None:
+                mask = (
+                    (df['player'] == player) &
+                    (df['side'] == side) &
+                    (df['line'].astype(float) == line) &
+                    (df['result'] == 'PENDING')
+                )
+                df.loc[mask, 'postpone_count'] = new_count
+
+            # Update Supabase
+            try:
+                from database import update_postpone_count
+                update_postpone_count(player, date_val, side, line, new_count)
+            except Exception as e:
+                print(f'    postpone_count update error: {e}')
+
+            # Alert if this bet has been stuck too long
+            if new_count >= POSTPONE_ALERT_AT:
+                _send_postpone_alert(player, side, line, new_count, detail)
+
+            continue   # leave PENDING — do not resolve
+
+        # ── Preview / status unknown: not yet started, leave PENDING ────────
+        if game_state == 'Preview':
+            print(f'  SKIP  {player:<24} — game not yet started')
+            skipped.append(player)
+            continue
+
+        # ── Final (or status not found — fall through to box score) ─────────
+        # If game_state is None, the pitcher wasn't in the status dict
+        # (could be postponed without a probable pitcher announced).
+        # In that case we fall through and let _match_pitcher decide.
+        if game_state is not None and game_state != 'Final':
+            skipped.append(player)
+            continue
+
+        # ── Step 2: Look up starter's individual stat line ──────────────────
         stats = _match_pitcher(player, box_scores.get(date_val, {}))
 
         if stats is None:
@@ -568,21 +746,16 @@ def auto_resolve():
             print(f'    Supabase update error: {e}')
 
         # ── Closing line capture ─────────────────────────────────────────────
-        # Look up closing odds for this player.  closing_odds is empty at
-        # 11:30 PM when games are over — we log null and never block resolve.
-        closing_record = closing_odds.get(_normalize(player), {})
+        closing_record        = closing_odds.get(_normalize(player), {})
         closing_side_odds_key = 'over_odds' if side == 'Over' else 'under_odds'
-        c_odds  = closing_record.get(closing_side_odds_key)   # None if unavailable
+        c_odds                = closing_record.get(closing_side_odds_key)
 
         clv = None
         if c_odds is not None:
             try:
                 open_impl  = _american_to_implied_prob(float(odds))
                 close_impl = _american_to_implied_prob(float(c_odds))
-                # Positive CLV = closing line more expensive than our opening price.
-                # close_implied > open_implied means the book moved against bettors
-                # after we got in — we beat the close.
-                clv = round(close_impl - open_impl, 4)
+                clv        = round(close_impl - open_impl, 4)
                 clv_vals.append(clv)
                 print(f'    CLV   {player:<24} opening {int(odds):+d}  closing {int(c_odds):+d}  CLV: {clv:+.1%}')
             except Exception:
@@ -604,7 +777,7 @@ def auto_resolve():
         except Exception as e:
             print(f'    Supabase closing_lines error (non-blocking): {e}')
 
-        # Keep local CSV in sync if it exists
+        # Keep local CSV in sync
         if df is not None:
             mask = (
                 (df['player'] == player) &
