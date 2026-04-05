@@ -131,74 +131,44 @@ def get_game_time(matchup: str) -> str:
 # Bet rationale summary
 # ─────────────────────────────────────────────
 
-def generate_summary(signal: dict) -> str:
-    """
-    Write a 1-2 sentence plain-English reason for the bet.
-    Built from the signal data — no API call needed.
-    """
-    player     = signal.get('player', 'This pitcher')
-    side       = str(signal.get('side', ''))
-    line       = signal.get('line')
-    prop_type  = str(signal.get('prop_type', 'pitcher_strikeouts'))
-    ev         = float(signal.get('ev', 0))
-    edge       = float(signal.get('model_prob', 0)) - float(signal.get('implied_prob', 0))
-    k9_curr    = signal.get('k9_current')
-    k9_hist    = signal.get('k9_historical')
-    k9_trend   = str(signal.get('k9_trend', 'NEW'))
-    xfip       = signal.get('xfip')
+def _rule_based_summary(signal: dict) -> str:
+    """Fallback summary when Claude API is unavailable."""
+    player       = signal.get('player', 'This pitcher')
+    side         = str(signal.get('side', ''))
+    line         = signal.get('line')
+    prop_type    = str(signal.get('prop_type', 'pitcher_strikeouts'))
+    ev           = float(signal.get('ev', 0))
+    edge         = float(signal.get('model_prob', 0)) - float(signal.get('implied_prob', 0))
+    k9_curr      = signal.get('k9_current')
+    k9_hist      = signal.get('k9_historical')
+    k9_trend     = str(signal.get('k9_trend', 'NEW'))
+    xfip         = signal.get('xfip')
     ip_per_start = signal.get('ip_per_start')
-
     parts = []
 
     if prop_type == 'pitcher_innings':
         avg_ip_str = f'{float(ip_per_start):.1f}' if ip_per_start and not pd.isna(ip_per_start) else None
-
         if side == 'Over':
             if avg_ip_str:
-                parts.append(
-                    f'{player} has averaged {avg_ip_str} innings per start, '
-                    f'making {line:.1f}+ IP a realistic expectation.'
-                )
+                parts.append(f'{player} has averaged {avg_ip_str} innings per start, making {line:.1f}+ IP a realistic expectation.')
             else:
                 parts.append(f'Model favours {player} going deep into this game.')
         else:
             if avg_ip_str and float(ip_per_start) < float(line):
-                parts.append(
-                    f'{player} has averaged only {avg_ip_str} IP per start — '
-                    f'clearing {line:.1f} innings would be above their norm.'
-                )
+                parts.append(f'{player} has averaged only {avg_ip_str} IP per start — clearing {line:.1f} innings would be above their norm.')
             else:
-                parts.append(
-                    f'Early hook risk or tough matchup makes the under {line:.1f} IP attractive here.'
-                )
-
+                parts.append(f'Early hook risk makes the under {line:.1f} IP attractive here.')
     else:
-        # Strikeout prop
         if k9_curr and k9_hist and not pd.isna(k9_hist):
-            k9_c = float(k9_curr)
-            k9_h = float(k9_hist)
-            delta = k9_c - k9_h
-
+            k9_c, k9_h = float(k9_curr), float(k9_hist)
             if k9_trend == 'UP':
-                parts.append(
-                    f'{player} is striking out batters at {k9_c:.1f} K/9 this season, '
-                    f'up from a {k9_h:.1f} historical average — stuff is trending sharper.'
-                )
+                parts.append(f'{player} is striking out batters at {k9_c:.1f} K/9 this season, up from a {k9_h:.1f} historical average — stuff is trending sharper.')
             elif k9_trend == 'DOWN':
-                parts.append(
-                    f'{player} is running at {k9_c:.1f} K/9, below their {k9_h:.1f} career norm — '
-                    f'the {side.lower()} aligns with that regression.'
-                )
+                parts.append(f'{player} is running at {k9_c:.1f} K/9, below their {k9_h:.1f} career norm — the {side.lower()} aligns with that regression.')
             else:
-                parts.append(
-                    f'{player} is on pace for {k9_c:.1f} K/9, consistent with their '
-                    f'{k9_h:.1f} historical average — a reliable profile.'
-                )
+                parts.append(f'{player} is on pace for {k9_c:.1f} K/9, consistent with their {k9_h:.1f} historical average — a reliable profile.')
         elif k9_curr and not pd.isna(k9_curr):
-            parts.append(
-                f'{player} is posting {float(k9_curr):.1f} K/9 this season.'
-            )
-
+            parts.append(f'{player} is posting {float(k9_curr):.1f} K/9 this season.')
         if xfip and not pd.isna(xfip):
             xfip_f = float(xfip)
             if xfip_f < 3.0:
@@ -208,14 +178,73 @@ def generate_summary(signal: dict) -> str:
             elif xfip_f > 4.5 and side == 'Under':
                 parts.append(f'Elevated xFIP of {xfip_f:.2f} suggests regression — under has extra value.')
 
-    # Always close with the edge
     parts.append(
-        f'Model probability is {float(signal.get("model_prob",0)):.0%} vs '
-        f'the book\'s {float(signal.get("implied_prob",0)):.0%} — '
+        f'Model probability is {float(signal.get("model_prob", 0)):.0%} vs '
+        f'the book\'s {float(signal.get("implied_prob", 0)):.0%} — '
         f'a {edge:+.0%} edge at {ev:+.0%} EV.'
     )
-
     return ' '.join(parts)
+
+
+def generate_summary(signal: dict) -> str:
+    """
+    Generate a short plain-English rationale for the bet using Claude.
+    Falls back to rule-based summary if the API is unavailable.
+    """
+    try:
+        import anthropic
+        from config import ANTHROPIC_API_KEY
+        if not ANTHROPIC_API_KEY:
+            return _rule_based_summary(signal)
+
+        player       = signal.get('player', 'Unknown')
+        side         = signal.get('side', '')
+        line         = signal.get('line', '')
+        prop_type    = signal.get('prop_type', 'pitcher_strikeouts')
+        ev           = float(signal.get('ev', 0))
+        edge         = float(signal.get('model_prob', 0)) - float(signal.get('implied_prob', 0))
+        k9_curr      = signal.get('k9_current')
+        k9_hist      = signal.get('k9_historical')
+        k9_trend     = signal.get('k9_trend', 'NEW')
+        xfip         = signal.get('xfip')
+        ip_per_start = signal.get('ip_per_start')
+        model_prob   = float(signal.get('model_prob', 0))
+        implied_prob = float(signal.get('implied_prob', 0))
+
+        prop_desc = (
+            f'{side} {line} strikeouts' if prop_type == 'pitcher_strikeouts'
+            else f'{side} {line} innings pitched'
+        )
+
+        facts = [f'Prop: {player} — {prop_desc}']
+        if k9_curr and not pd.isna(k9_curr):
+            facts.append(f'Current K/9: {float(k9_curr):.1f}')
+        if k9_hist and not pd.isna(k9_hist):
+            facts.append(f'Historical K/9 (2yr avg): {float(k9_hist):.1f} — trend: {k9_trend}')
+        if xfip and not pd.isna(xfip):
+            facts.append(f'xFIP: {float(xfip):.2f}')
+        if ip_per_start and not pd.isna(ip_per_start):
+            facts.append(f'Avg IP/start: {float(ip_per_start):.1f}')
+        facts.append(f'Model probability: {model_prob:.0%} | Book implied: {implied_prob:.0%}')
+        facts.append(f'Edge: {edge:+.0%} | EV: {ev:+.0%}')
+
+        prompt = (
+            'You write short, punchy betting rationales for a baseball prop betting bot. '
+            'Given these stats, write exactly 2 sentences explaining why this is a good bet. '
+            'Be direct and specific — reference the numbers. No fluff, no disclaimers.\n\n'
+            + '\n'.join(facts)
+        )
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=120,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        return response.content[0].text.strip()
+
+    except Exception:
+        return _rule_based_summary(signal)
 
 
 # ─────────────────────────────────────────────
