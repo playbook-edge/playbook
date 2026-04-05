@@ -534,6 +534,7 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'velo_factor':      round(velo_factor, 3),
             'spin_rate':        round(spin_rate, 0) if spin_rate is not None else None,
             'pitch_mix':        pitch_mix,
+            'throws':           throws,
             'opp_team':         opp_team,
             'opp_k_pct':        opp_k_pct,
             'matchup_factor':   matchup_factor,
@@ -761,11 +762,11 @@ def run():
         print(f'  Real props will show tighter edges (1-6% on good plays, not 10-40%).')
         print(f'  Degen-tier alerts on synthetic data are expected and not meaningful.')
 
-    # --- Fire Discord alerts ---
-    print(f'\n--- Firing Discord Alerts ---')
+    # --- Fire Discord daily card ---
+    print(f'\n--- Firing Discord Daily Card ---')
     try:
-        from alerts.discord_alerts import fire_alerts_from_signals
-        fire_alerts_from_signals(signals, ev_threshold=EV_THRESHOLD, max_alerts=5)
+        from alerts.discord_alerts import send_daily_card
+        send_daily_card(signals, ev_threshold=EV_THRESHOLD, max_bets=5)
     except Exception as e:
         print(f'  Alert error: {e}')
 

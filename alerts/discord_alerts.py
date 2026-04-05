@@ -605,6 +605,274 @@ def send_heartbeat(game_count: int, pending_trades: int):
     hook.execute()
 
 
+# -----------------------------------------------
+# Daily card — all bets as one stacked Discord message
+# -----------------------------------------------
+
+def _ordinal(n: int) -> str:
+    if 11 <= (n % 100) <= 13:
+        return f'{n}th'
+    return f'{n}{["th","st","nd","rd","th"][min(n % 10, 4)]}'
+
+
+def _velo_trend_label(velo_trend) -> str:
+    if velo_trend is None or (isinstance(velo_trend, float) and pd.isna(velo_trend)):
+        return 'Velocity data unavailable'
+    vt = float(velo_trend)
+    if vt >= 0.5:
+        return f'Velocity trending up {vt:+.1f} mph over last 7 days'
+    if vt <= -0.5:
+        return f'Velocity trending down {vt:+.1f} mph over last 7 days'
+    return 'Velocity stable over last 7 days'
+
+
+def _krate_rank_sentence(opp_team: str, throws: str, krates_df: pd.DataFrame) -> str:
+    if not opp_team or krates_df is None:
+        return ''
+    col  = 'vs_RHP' if str(throws).upper() != 'L' else 'vs_LHP'
+    hand = 'RHP'   if str(throws).upper() != 'L' else 'LHP'
+    df   = krates_df.dropna(subset=[col]).copy()
+    if df.empty:
+        return ''
+    df    = df.sort_values(col, ascending=False).reset_index(drop=True)
+    match = df[df['team'] == opp_team]
+    if match.empty:
+        return ''
+    rank  = int(match.index[0]) + 1
+    total = len(df)
+    kpct  = float(match.iloc[0][col])
+    NAMES = {
+        'ATH': 'Oakland',      'ATL': 'Atlanta',        'AZ': 'Arizona',
+        'BAL': 'Baltimore',    'BOS': 'Boston',          'CHC': 'Chicago Cubs',
+        'CWS': 'Chicago White Sox', 'CIN': 'Cincinnati', 'CLE': 'Cleveland',
+        'COL': 'Colorado',     'DET': 'Detroit',         'HOU': 'Houston',
+        'KC':  'Kansas City',  'LAA': 'LA Angels',       'LAD': 'LA Dodgers',
+        'MIA': 'Miami',        'MIL': 'Milwaukee',       'MIN': 'Minnesota',
+        'NYM': 'NY Mets',      'NYY': 'NY Yankees',      'PHI': 'Philadelphia',
+        'PIT': 'Pittsburgh',   'SD':  'San Diego',        'SEA': 'Seattle',
+        'SF':  'San Francisco','STL': 'St. Louis',        'TB':  'Tampa Bay',
+        'TEX': 'Texas',        'TOR': 'Toronto',          'WSH': 'Washington',
+    }
+    name = NAMES.get(opp_team, opp_team)
+    return f'{name} ranks {_ordinal(rank)} of {total} in K-rate vs {hand} this season ({kpct:.1%})'
+
+
+def _daily_card_narrative(signal: dict, krate_sentence: str) -> str:
+    """
+    2-3 sentence Claude narrative for a casual bettor.
+    Falls back to rule-based summary if the API key is missing.
+    """
+    try:
+        import anthropic
+        from config import ANTHROPIC_API_KEY
+        if not ANTHROPIC_API_KEY:
+            return _rule_based_summary(signal)
+
+        player     = signal.get('player', 'Unknown')
+        side       = signal.get('side', '')
+        line       = signal.get('line', '')
+        prop_type  = str(signal.get('prop_type', 'pitcher_strikeouts'))
+        k9_curr    = signal.get('k9_current')
+        k9_hist    = signal.get('k9_historical')
+        k9_trend   = signal.get('k9_trend', 'NEW')
+        xfip       = signal.get('xfip')
+        velo_trend = signal.get('velo_trend')
+
+        prop_desc = (
+            f'{side} {line} strikeouts' if prop_type == 'pitcher_strikeouts'
+            else f'{side} {line} innings pitched'
+        )
+
+        facts = [f'Pitcher: {player}', f'Prop: {prop_desc}']
+        if k9_curr and not pd.isna(k9_curr):
+            facts.append(f'K/9 this season: {float(k9_curr):.1f}')
+        if k9_hist and not pd.isna(k9_hist):
+            facts.append(f'Career avg K/9: {float(k9_hist):.1f} (trend vs history: {k9_trend})')
+        if xfip and not pd.isna(xfip):
+            facts.append(f'xFIP: {float(xfip):.2f}')
+        if velo_trend is not None and not pd.isna(velo_trend):
+            facts.append(f'Velocity last 7 days vs 30-day avg: {float(velo_trend):+.1f} mph')
+        if krate_sentence:
+            facts.append(f'Opponent: {krate_sentence}')
+
+        prompt = (
+            'You write short betting write-ups for a casual baseball fan who wants to understand '
+            'why a bet is worth considering. Write 2-3 sentences about this prop. '
+            'Mention the pitcher by name, reference the strikeout or innings line, '
+            'and use at least one stat from the list below. '
+            'Be confident and clear — no hype, no disclaimers, no emojis.\n\n'
+            + '\n'.join(facts)
+        )
+
+        client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=200,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        return response.content[0].text.strip()
+
+    except Exception:
+        return _rule_based_summary(signal)
+
+
+def send_daily_card(signals_df: pd.DataFrame,
+                    ev_threshold: float = 0.04,
+                    max_bets: int = 5,
+                    webhook_url: str = None,
+                    dry_run: bool = False) -> int:
+    """
+    Send today's flagged bets as a single Discord message (one embed per bet,
+    all stacked in one webhook call).
+
+    Removes: model prob, edge %, EV %, Kelly stake.
+    Shows: tier badge, bet title, book/odds/time, IQ bar, velo trend,
+           K-rate rank sentence, Claude narrative.
+
+    dry_run=True prints the preview without sending to Discord.
+    """
+    from discord_webhook import DiscordWebhook, DiscordEmbed
+
+    url = webhook_url or DISCORD_WEBHOOK_CONSERVATIVE
+    if not url and not dry_run:
+        print('  ERROR: DISCORD_WEBHOOK_CONSERVATIVE not set in .env')
+        return 0
+
+    flagged = signals_df[signals_df['ev'] >= ev_threshold].copy()
+    flagged = flagged.sort_values('ev', ascending=False).head(max_bets)
+
+    if flagged.empty:
+        print(f'  No signals above {ev_threshold:.0%} EV -- no daily card sent.')
+        return 0
+
+    # Load team K-rates for ranking
+    krates_df = None
+    try:
+        krates_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), '..', 'data', 'raw', 'team_krates.csv')
+        )
+        if os.path.exists(krates_path):
+            krates_df = pd.read_csv(krates_path)
+    except Exception:
+        pass
+
+    hook = DiscordWebhook(url=url or 'http://dry-run', rate_limit_retry=True)
+    bets = list(flagged.iterrows())
+
+    print(f'\n{"=" * 52}')
+    print(f'  DAILY CARD PREVIEW ({len(bets)} bet(s))')
+    print(f'{"=" * 52}')
+
+    for idx, (_, row) in enumerate(bets):
+        signal  = row.to_dict()
+        is_last = (idx == len(bets) - 1)
+        ev      = float(signal['ev'])
+        edge    = float(signal['model_prob']) - float(signal['implied_prob'])
+        xfip    = signal.get('xfip')
+        ip_ps   = signal.get('ip_per_start')
+
+        # Tier — swap DEGEN emoji to casino chip per spec
+        tier_label, color, tier_emoji = get_tier(ev)
+        if tier_label == 'DEGEN':
+            tier_emoji = '\U0001f3b0'   # 🎰
+
+        # IQ bar — ▓░ for Discord, ##.. for terminal
+        iq_score       = calculate_playbook_iq(ev, edge, xfip, ip_ps)
+        filled         = round(iq_score / 10)
+        iq_bar_discord = '\u2593' * filled + '\u2591' * (10 - filled)
+        iq_bar_term    = '#' * filled + '.' * (10 - filled)
+
+        # Velo trend
+        velo_trend = signal.get('velo_trend')
+        if velo_trend is None or (isinstance(velo_trend, float) and pd.isna(velo_trend)):
+            trend_emoji = '\u26aa'        # ⚪
+        elif float(velo_trend) >= 0.5:
+            trend_emoji = '\U0001f4c8'   # 📈
+        elif float(velo_trend) <= -0.5:
+            trend_emoji = '\U0001f4c9'   # 📉
+        else:
+            trend_emoji = '\u27a1\ufe0f' # ➡️
+
+        trend_label = _velo_trend_label(velo_trend)
+
+        # Bet title and subline
+        prop_type  = str(signal.get('prop_type', 'pitcher_strikeouts'))
+        side       = signal.get('side', '')
+        line       = float(signal.get('line', 0))
+        prop_label = (
+            f'Over {line:.1f} Ks'  if side == 'Over' and prop_type == 'pitcher_strikeouts' else
+            f'Under {line:.1f} Ks' if prop_type == 'pitcher_strikeouts' else
+            f'{side} {line:.1f} IP'
+        )
+        bet_title    = f'{signal["player"]} \u2014 {prop_label}'
+        odds_display = f'{int(signal["odds"]):+d}'
+        game_time    = get_game_time(str(signal.get('matchup', '')))
+        book_str     = signal.get('book', 'Multiple')
+        subline      = f'{book_str} \u00b7 {odds_display} \u00b7 {game_time}'
+
+        # K-rate rank sentence
+        opp_team       = signal.get('opp_team')
+        throws         = str(signal.get('throws', 'R'))
+        krate_sentence = _krate_rank_sentence(opp_team, throws, krates_df)
+
+        # Claude narrative
+        narrative = _daily_card_narrative(signal, krate_sentence)
+
+        # Discord embed description
+        desc = '\n'.join(filter(None, [
+            f'**{bet_title}**',
+            subline,
+            '',
+            f'PlaybookIQ: **{iq_score}/100**  {iq_bar_discord}',
+            f'{trend_emoji}  {trend_label}',
+            krate_sentence,
+            '',
+            narrative,
+        ]))
+
+        embed = DiscordEmbed(
+            title=f'{tier_emoji}  {tier_label}',
+            description=desc,
+            color=color,
+        )
+        embed.set_timestamp()
+        if is_last:
+            embed.set_footer(
+                text=(
+                    '\u26a0\ufe0f  For entertainment purposes only. Must be 21+. '
+                    'Past results do not guarantee future performance.'
+                )
+            )
+        hook.add_embed(embed)
+
+        # Terminal preview (ASCII-safe)
+        print(f'\n  Tier    : {tier_label}')
+        print(f'  Bet     : {signal["player"]} -- {prop_label}')
+        print(f'  Subline : {book_str} | {odds_display} | {game_time}')
+        print(f'  IQ      : {iq_score}/100  [{iq_bar_term}]')
+        print(f'  Trend   : {trend_label}')
+        if krate_sentence:
+            print(f'  K-rate  : {krate_sentence}')
+        print(f'  Narrative: {narrative}')
+        if not is_last:
+            print('\n  ' + '- ' * 24)
+
+    print(f'\n  Footer: For entertainment purposes only. Must be 21+.')
+    print(f'{"=" * 52}\n')
+
+    if dry_run:
+        print('  dry_run=True -- preview only, nothing sent.')
+        return len(bets)
+
+    response = hook.execute()
+    success  = hasattr(response, 'status_code') and response.status_code in (200, 204)
+    if success:
+        print(f'  Daily card sent ({len(bets)} bet(s)).')
+    else:
+        print(f'  Daily card send failed.')
+    return len(bets) if success else 0
+
+
 # ─────────────────────────────────────────────
 # Standalone test / demo
 # ─────────────────────────────────────────────
@@ -642,24 +910,40 @@ def run():
 
 
 if __name__ == '__main__':
-    print('Testing health alert functions (no webhook required)...\n')
+    print('Daily card preview (dry run -- nothing sent to Discord)...\n')
 
-    send_pipeline_summary(
-        results={
-            'Baseball Savant':  'completed in 12.3s',
-            'FanGraphs':        'completed in 8.1s',
-            'Historical Stats': 'completed in 4.2s',
-            'Player Baselines': 'completed in 6.0s',
-            'Odds API':         'ERROR: 401 Unauthorized — check ODDS_API_KEY',
-            'EV Calculator':    'completed in 2.8s',
-        },
-        runtime_seconds=220,
-        signal_count=3,
-    )
+    fake_signals = pd.DataFrame([{
+        'player':           'Lance McCullers Jr.',
+        'prop_type':        'pitcher_strikeouts',
+        'side':             'Over',
+        'line':             6.5,
+        'odds':             -115,
+        'ev':               0.09,
+        'model_prob':       0.62,
+        'implied_prob':     0.53,
+        'flag':             True,
+        'book':             'DraftKings',
+        'matchup':          'Astros @ Red Sox',
+        'k9_current':       10.4,
+        'k9_historical':    9.6,
+        'k9_trend':         'UP',
+        'k9_used':          10.1,
+        'xfip':             3.12,
+        'ip_per_start':     6.1,
+        'hist_reliability': 85,
+        'velo_trend':       1.4,
+        'spin_rate':        2480,
+        'pitch_mix':        '{"FF": 0.42, "SL": 0.31, "CH": 0.18, "CU": 0.09}',
+        'throws':           'R',
+        'opp_team':         'BOS',
+        'opp_k_pct':        0.271,
+        'matchup_factor':   1.09,
+        'velo_factor':      1.021,
+        'kelly_pct':        0.03,
+        'kelly_dollars':    30.0,
+        'prob_capped':      False,
+        'low_line_note':    None,
+        'expected_ks':      6.9,
+    }])
 
-    send_error_alert(
-        step_name='Odds API',
-        error_message='401 Unauthorized — check ODDS_API_KEY in Railway env vars',
-    )
-
-    send_heartbeat(game_count=12, pending_trades=4)
+    send_daily_card(fake_signals, ev_threshold=0.04, dry_run=True)
