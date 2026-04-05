@@ -150,9 +150,9 @@ After all 6 steps, `send_pipeline_summary()` fires to the health channel.
 - **PlaybookIQ score (0-100)**: composite of EV (40pts) + edge (30pts) + xFIP quality (20pts) + sample size (10pts)
 - Game time looked up live from MLB Stats API
 - Bet alerts → `DISCORD_WEBHOOK_CONSERVATIVE`
-- `send_alert()` and `fire_alerts_from_signals()` still exist but are no longer called by the pipeline (kept for manual use)
+- `fire_alerts_from_signals()`: tiered caps — Conservative 5, Moderate 4, Aggressive 3, Degen 1 — sorted by PlaybookIQ descending within each tier
 - **Health functions** (go to `DISCORD_WEBHOOK_HEALTH` only — never to bet channels):
-  - `send_pipeline_summary(results, runtime_seconds, signal_count)` — full run summary after step 6
+  - `send_pipeline_summary(results, runtime_seconds, signal_count, tier_breakdown)` — full run summary after step 6; tier_breakdown renders "🟢 3 · 🟡 2 · 🔴 1 · 🎰 0 — 6 total" in the embed
   - `send_error_alert(step_name, error_message)` — immediate alert on any step failure
   - `send_heartbeat(game_count, pending_trades)` — daily alive-check (call manually or from resolve script)
 
