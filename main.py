@@ -1,40 +1,160 @@
 """
-main.py — Entry point for the Playbook betting intelligence bot.
+main.py — Playbook daily pipeline.
 
-Run this file to start the bot:
-    python main.py
+Runs every step in order:
+  1. baseball_savant.py  — today's starters + Statcast stats
+  2. fangraphs.py        — team K-rates + pitcher leaderboard
+  3. odds_api.py         — live prop lines from DK / FD / BetMGM
+  4. ev_calculator.py    — find edges, calculate EV, fire Discord alerts
 
-Right now it just confirms everything is loaded correctly.
-As you build scrapers, models, and alerts, they'll be called from here.
+Schedule this with Windows Task Scheduler to run automatically each day.
+Or run manually: python main.py
 """
+
+import os
+import sys
+import time
+import traceback
+from datetime import datetime
+
+# ── Make sure imports resolve from the project root ──────────
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 
 import config
 
+LOG_DIR  = os.path.join(ROOT, 'logs')
+LOG_FILE = os.path.join(LOG_DIR, f'pipeline_{datetime.now().strftime("%Y-%m-%d")}.log')
 
-def run():
-    print("=== Playbook is starting up ===")
 
-    # Quick config check — warns you if any keys are missing
-    missing = []
-    if not config.ANTHROPIC_API_KEY:
-        missing.append("ANTHROPIC_API_KEY")
-    if not config.SUPABASE_URL:
-        missing.append("SUPABASE_URL")
-    if not config.ODDS_API_KEY:
-        missing.append("ODDS_API_KEY")
-    if not config.DISCORD_WEBHOOK_URL:
-        missing.append("DISCORD_WEBHOOK_URL")
+# ─────────────────────────────────────────────────────────────
+# Logging — writes to both terminal and a daily log file
+# ─────────────────────────────────────────────────────────────
+
+class Logger:
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.file = open(path, 'a', encoding='utf-8')
+
+    def log(self, msg=''):
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        line = f'[{timestamp}] {msg}'
+        print(line)
+        self.file.write(line + '\n')
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
+# ─────────────────────────────────────────────────────────────
+# Discord summary message (pipeline complete notification)
+# ─────────────────────────────────────────────────────────────
+
+def send_pipeline_summary(logger, results: dict):
+    try:
+        from discord_webhook import DiscordWebhook, DiscordEmbed
+
+        url = config.DISCORD_WEBHOOK_CONSERVATIVE
+        if not url:
+            return
+
+        hook  = DiscordWebhook(url=url, rate_limit_retry=True)
+        embed = DiscordEmbed(color=0x3498DB)
+
+        status_lines = []
+        for step, info in results.items():
+            icon = 'OK' if info['ok'] else 'FAIL'
+            status_lines.append(f'[{icon}]  {step}  —  {info["note"]}')
+
+        embed.set_title('Playbook Pipeline Complete')
+        embed.set_description('```\n' + '\n'.join(status_lines) + '\n```')
+        embed.set_footer(text=f'Run at {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
+
+        hook.add_embed(embed)
+        hook.execute()
+    except Exception as e:
+        logger.log(f'  Pipeline summary failed: {e}')
+
+
+# ─────────────────────────────────────────────────────────────
+# Step runner — isolates each script so one failure doesn't
+#               stop the whole pipeline
+# ─────────────────────────────────────────────────────────────
+
+def run_step(logger, name, fn):
+    logger.log(f'--- {name} ---')
+    start = time.time()
+    try:
+        fn()
+        elapsed = round(time.time() - start, 1)
+        logger.log(f'    Done ({elapsed}s)')
+        return {'ok': True, 'note': f'completed in {elapsed}s'}
+    except Exception as e:
+        logger.log(f'    FAILED: {e}')
+        logger.log(traceback.format_exc())
+        return {'ok': False, 'note': str(e)[:80]}
+
+
+# ─────────────────────────────────────────────────────────────
+# Pipeline steps
+# ─────────────────────────────────────────────────────────────
+
+def step_savant():
+    from scrapers.baseball_savant import run
+    run()
+
+def step_fangraphs():
+    from scrapers.fangraphs import run
+    run()
+
+def step_odds():
+    from scrapers.odds_api import run
+    run()
+
+def step_ev():
+    from models.ev_calculator import run
+    run()
+
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+
+def main():
+    logger = Logger(LOG_FILE)
+    logger.log('=' * 50)
+    logger.log(f'PLAYBOOK PIPELINE START — {datetime.now().strftime("%A, %B %d %Y")}')
+    logger.log('=' * 50)
+
+    # Config check
+    missing = [k for k, v in {
+        'ODDS_API_KEY':                config.ODDS_API_KEY,
+        'DISCORD_WEBHOOK_CONSERVATIVE': config.DISCORD_WEBHOOK_CONSERVATIVE,
+    }.items() if not v]
 
     if missing:
-        print(f"Warning: These keys are not set in your .env file: {', '.join(missing)}")
+        logger.log(f'WARNING: Missing keys in .env: {", ".join(missing)}')
     else:
-        print("All API keys loaded.")
+        logger.log('Config OK')
 
-    print(f"Sport: {config.SPORT}")
-    print(f"Minimum edge to alert: {config.MIN_EDGE_PERCENT}%")
-    print(f"Bankroll: ${config.BANKROLL}")
-    print("=== Ready. ===")
+    results = {}
+
+    results['Baseball Savant'] = run_step(logger, 'Step 1/4  Baseball Savant',  step_savant)
+    results['FanGraphs']       = run_step(logger, 'Step 2/4  FanGraphs',         step_fangraphs)
+    results['Odds API']        = run_step(logger, 'Step 3/4  Odds API',           step_odds)
+    results['EV Calculator']   = run_step(logger, 'Step 4/4  EV + Alerts',        step_ev)
+
+    # Summary
+    passed = sum(1 for r in results.values() if r['ok'])
+    logger.log('')
+    logger.log(f'Pipeline finished: {passed}/4 steps passed')
+    logger.log(f'Log saved to: {LOG_FILE}')
+    logger.log('=' * 50)
+
+    send_pipeline_summary(logger, results)
+    logger.close()
 
 
-if __name__ == "__main__":
-    run()
+if __name__ == '__main__':
+    main()
