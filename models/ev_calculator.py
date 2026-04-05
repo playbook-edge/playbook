@@ -3,8 +3,12 @@ models/ev_calculator.py — Core brain of Playbook.
 
 Three layers:
   1. Pure math  — EV, implied probability, Kelly Criterion
-  2. Model      — estimates pitcher K probability using Poisson distribution
+  2. Model      — Poisson (strikeouts) + Normal (innings) probability models
   3. Pipeline   — reads today's files, matches props to stats, flags edges
+
+Prop types supported:
+  pitcher_strikeouts  — Over/Under on total Ks in today's start
+  pitcher_innings     — Over/Under on innings pitched (e.g. over 5.5)
 
 Usage:
     python models/ev_calculator.py
@@ -15,7 +19,7 @@ import sys
 import math
 import numpy as np
 import pandas as pd
-from scipy.stats import poisson
+from scipy.stats import poisson, norm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -156,6 +160,29 @@ def prob_under_line(expected_ks: float, line: float) -> float:
     return round(1 - prob_over_line(expected_ks, line), 4)
 
 
+# ── Innings model (Normal distribution) ─────────────────────
+# Innings pitched per start behaves like a Normal distribution:
+# most starts cluster around the pitcher's average with a
+# standard deviation of ~1.2 innings.
+
+IP_STD_DEFAULT = 1.2   # typical start-to-start variation in innings
+
+def prob_over_innings(avg_ip: float, line: float,
+                      ip_std: float = IP_STD_DEFAULT) -> float:
+    """
+    Probability the pitcher records MORE than `line` innings.
+
+    Uses a Normal distribution centred on the pitcher's historical
+    average IP per start. Example: avg_ip=6.1, line=5.5 → likely over.
+    """
+    return round(1 - norm.cdf(line, loc=avg_ip, scale=ip_std), 4)
+
+
+def prob_under_innings(avg_ip: float, line: float,
+                       ip_std: float = IP_STD_DEFAULT) -> float:
+    return round(1 - prob_over_innings(avg_ip, line, ip_std), 4)
+
+
 # ============================================================
 # LAYER 3 — Pipeline: match props → stats → EV signals
 # ============================================================
@@ -264,9 +291,19 @@ def build_ev_signals(props_df:    pd.DataFrame,
                 curr_weight = 1 - hist_weight
                 blended_k9  = curr_weight * k9 + hist_weight * hist_k9
 
-        expected_ks = estimate_expected_ks(blended_k9, ip_per_start)
-        model_over  = prob_over_line(expected_ks, line)
-        model_under = prob_under_line(expected_ks, line)
+        prop_type = str(prop.get('prop_type', 'pitcher_strikeouts'))
+
+        # ── Route to the correct probability model ────────────
+        if prop_type == 'pitcher_innings':
+            # Normal distribution around historical avg IP/start
+            model_over  = prob_over_innings(ip_per_start, line)
+            model_under = prob_under_innings(ip_per_start, line)
+            expected_ks = None   # not applicable for innings props
+        else:
+            # Default: pitcher_strikeouts — Poisson model
+            expected_ks = estimate_expected_ks(blended_k9, ip_per_start)
+            model_over  = prob_over_line(expected_ks, line)
+            model_under = prob_under_line(expected_ks, line)
 
         book_over_prob, book_under_prob = remove_vig(over_odds, under_odds)
 
@@ -284,10 +321,11 @@ def build_ev_signals(props_df:    pd.DataFrame,
 
         base = {
             'player':           player,
+            'prop_type':        prop_type,
             'matchup':          prop.get('matchup', ''),
             'book':             prop.get('book', ''),
             'line':             line,
-            'expected_ks':      round(expected_ks, 2),
+            'expected_ks':      round(expected_ks, 2) if expected_ks is not None else None,
             'k9_used':          round(blended_k9, 2),
             'k9_current':       round(k9, 2),
             'k9_historical':    round(hist_k9, 2) if hist_k9 is not None else None,
@@ -329,38 +367,69 @@ def build_ev_signals(props_df:    pd.DataFrame,
 
 def make_synthetic_props(stats_df: pd.DataFrame, savant_df: pd.DataFrame) -> pd.DataFrame:
     """
-    When no real props file exists, generate realistic synthetic lines
-    from each pitcher's K/9 so we can demonstrate the model.
+    When no real props file exists, generate realistic synthetic lines.
 
-    Line = expected Ks rounded to nearest .5
-    Odds = typical market pricing with slight variation.
+    STRIKEOUT lines: set ~10% BELOW expected Ks (as real books do)
+    so the model sees genuine Over AND Under opportunities.
+
+    INNINGS lines: set at 5.5 for most starters — the most common
+    real-world line. Good starters averaging 6.5 IP show Over value;
+    shaky starters averaging 5.0 show Under value.
     """
     rows = []
     for _, st in stats_df.iterrows():
         ip_per_start = float(st['ip']) / max(float(st['starts']), 1)
         exp_ks       = estimate_expected_ks(float(st['k9']), ip_per_start)
 
-        # Set line just above/below expected to create over/under tension
-        line = round(exp_ks * 2) / 2   # round to nearest .5
-
-        # Vary the juice slightly per pitcher to simulate real market
-        rng       = np.random.default_rng(seed=int(abs(hash(st['name'])) % 10000))
-        over_odds = int(rng.choice([-125, -120, -115, -110, -105, +100, +105, +110]))
-        under_odds_map = {-125: +105, -120: +100, -115: -105, -110: -110,
-                          -105: -115, +100: -120, +105: -125, +110: -130}
-        under_odds = under_odds_map.get(over_odds, -110)
-
-        # Match to savant for team name
+        rng = np.random.default_rng(seed=int(abs(hash(st['name'])) % 10000))
         sv_name = match_name(st['name'], savant_df['name'])
-        matchup  = savant_df[savant_df['name'] == sv_name].iloc[0]['team'] if sv_name else st['team']
+        matchup = savant_df[savant_df['name'] == sv_name].iloc[0]['team'] \
+                  if sv_name else st['team']
+
+        # ── Strikeout prop ──────────────────────────────────────
+        # Real books shade lines ~10% below model expectation to
+        # attract Over action. Setting at 85-90% of expected Ks
+        # creates genuine two-sided markets.
+        ks_line = max(0.5, round((exp_ks * rng.uniform(0.82, 0.92)) * 2) / 2)
+
+        # Juice: Overs typically slight underdogs vs Unders early season
+        over_odds_k  = int(rng.choice([-115, -110, -105, +100, +105, +110, +115]))
+        under_map    = {-115: +105, -110: -105, -105: -110, +100: -115,
+                        +105: -120, +110: -125, +115: -130}
+        under_odds_k = under_map.get(over_odds_k, -110)
 
         rows.append({
             'player':     st['name'],
             'matchup':    matchup,
             'prop_type':  'pitcher_strikeouts',
-            'line':       line,
-            'over_odds':  over_odds,
-            'under_odds': under_odds,
+            'line':       ks_line,
+            'over_odds':  over_odds_k,
+            'under_odds': under_odds_k,
+            'book':       'Synthetic (no live props yet)',
+        })
+
+        # ── Innings pitched prop ────────────────────────────────
+        # Standard market line is 5.5 IP for most starters.
+        # Elite workhorses sometimes get 5.5/6.0 split markets.
+        if ip_per_start >= 6.2:
+            ip_line = 6.0
+        elif ip_per_start >= 5.5:
+            ip_line = 5.5
+        else:
+            ip_line = 4.5
+
+        over_odds_ip  = int(rng.choice([-130, -120, -115, -110, -105, +100]))
+        under_map_ip  = {-130: +110, -120: +100, -115: +105, -110: -110,
+                         -105: -115, +100: -120}
+        under_odds_ip = under_map_ip.get(over_odds_ip, -110)
+
+        rows.append({
+            'player':     st['name'],
+            'matchup':    matchup,
+            'prop_type':  'pitcher_innings',
+            'line':       ip_line,
+            'over_odds':  over_odds_ip,
+            'under_odds': under_odds_ip,
             'book':       'Synthetic (no live props yet)',
         })
 
@@ -442,34 +511,40 @@ def run():
     if flagged.empty:
         print(f'  No props exceed {EV_THRESHOLD:.0%} EV today.')
         print(f'  Closest plays:')
-        closest = signals.head(5)[['player','side','line','odds','model_prob','implied_prob','ev']]
+        closest = signals.head(5)[['player','prop_type','side','line','odds','model_prob','implied_prob','ev']]
         print(closest.to_string(index=False))
     else:
-        print(f'  {len(flagged)} props flagged\n')
-        for _, r in flagged.iterrows():
-            edge = r['model_prob'] - r['implied_prob']
-            print(
-                f"  {r['player']:<24} {r['side']:5}  {r['line']:.1f}  "
-                f"odds: {int(r['odds']):+d}  "
-                f"model: {r['model_prob']:.1%}  "
-                f"implied: {r['implied_prob']:.1%}  "
-                f"edge: {edge:+.1%}  "
-                f"EV: {r['ev']:+.1%}  "
-                f"Kelly: ${r['kelly_dollars']:.0f}"
-            )
+        # Print by prop type so they're easy to scan
+        for ptype in ['pitcher_strikeouts', 'pitcher_innings']:
+            subset = flagged[flagged['prop_type'] == ptype]
+            if subset.empty:
+                continue
+            label = 'STRIKEOUT PROPS' if ptype == 'pitcher_strikeouts' else 'INNINGS PROPS'
+            print(f'\n  -- {label} ({len(subset)} flagged) --')
+            for _, r in subset.iterrows():
+                edge = r['model_prob'] - r['implied_prob']
+                print(
+                    f"  {r['player']:<24} {r['side']:5}  {r['line']:.1f}  "
+                    f"odds: {int(r['odds']):+d}  "
+                    f"model: {r['model_prob']:.1%}  "
+                    f"implied: {r['implied_prob']:.1%}  "
+                    f"edge: {edge:+.1%}  "
+                    f"EV: {r['ev']:+.1%}  "
+                    f"Kelly: ${r['kelly_dollars']:.0f}"
+                )
 
     # --- EV explanation ---
     print(f'\n--- How to read this ---')
-    print(f'  model prob  = Playbook\'s estimated probability (Poisson + K/9)')
-    print(f'  implied prob = book\'s probability after removing vig')
-    print(f'  edge        = model prob minus implied prob (your advantage)')
-    print(f'  EV          = expected profit per $1 bet')
-    print(f'  Kelly $     = recommended stake from ${bankroll:.0f} bankroll')
+    print(f'  model prob   = Playbook probability (Poisson for Ks / Normal for innings)')
+    print(f'  implied prob = book probability after removing vig')
+    print(f'  edge         = model prob minus implied prob (your advantage)')
+    print(f'  EV           = expected profit per $1 bet')
+    print(f'  Kelly $      = recommended stake from ${bankroll:.0f} bankroll')
 
     if using_synthetic:
-        print(f'\n  NOTE: Synthetic props are generated from each pitcher\'s K/9.')
-        print(f'  Lines are set at expected Ks; odds are randomised. Real props')
-        print(f'  will show different lines and tighter edges.')
+        print(f'\n  NOTE: Synthetic — lines set below expected value to simulate real markets.')
+        print(f'  Real props will show tighter edges (1-6% on good plays, not 10-40%).')
+        print(f'  Degen-tier alerts on synthetic data are expected and not meaningful.')
 
     # --- Fire Discord alerts ---
     print(f'\n--- Firing Discord Alerts ---')

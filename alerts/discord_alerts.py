@@ -171,9 +171,14 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
         icon_url='https://upload.wikimedia.org/wikipedia/commons/thumb/a/a7/Camponotus_flavomarginatus_ant.jpg/320px-Camponotus_flavomarginatus_ant.jpg'
     )
 
+    prop_type = signal.get('prop_type', 'pitcher_strikeouts')
+    prop_label = {
+        'pitcher_strikeouts': f'{signal["side"]} {signal["line"]:.1f} Ks',
+        'pitcher_innings':    f'{signal["side"]} {signal["line"]:.1f} IP',
+    }.get(str(prop_type), f'{signal["side"]} {signal["line"]:.1f}')
+
     embed.set_title(
-        f'{tier_emoji}  {signal["player"]}  —  '
-        f'{signal["side"]} {signal["line"]:.1f} Ks  {odds_display}'
+        f'{tier_emoji}  {signal["player"]}  —  {prop_label}  {odds_display}'
     )
 
     embed.set_description(
@@ -193,7 +198,7 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
     embed.add_embed_field(name='Edge',          value=f'{edge:+.1%}',                          inline=True)
 
     # Row 3
-    embed.add_embed_field(name='Prop',          value=f'{signal["side"]} {signal["line"]:.1f} strikeouts', inline=True)
+    embed.add_embed_field(name='Prop',          value=prop_label, inline=True)
     embed.add_embed_field(name='Book',          value=book_str,                                 inline=True)
     embed.add_embed_field(name='Game Time',     value=game_time,                                inline=True)
 
