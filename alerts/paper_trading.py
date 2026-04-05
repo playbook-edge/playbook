@@ -418,28 +418,50 @@ def auto_resolve():
     print('  PLAYBOOK -- Auto-Resolve Paper Trades')
     print('=' * 55)
 
-    df = _load_trades()
-    pending = df[df['result'] == 'PENDING']
+    # Load pending trades — Supabase first (works on Railway where CSV doesn't
+    # persist), fall back to local CSV for Windows use.
+    pending_rows = []
+    source       = 'csv'
 
-    if pending.empty:
-        print('No pending bets to resolve.')
-        return
+    try:
+        from database import get_pending_trades
+        db_rows = get_pending_trades()
+        if db_rows:
+            pending_rows = db_rows
+            source       = 'supabase'
+            print(f'\nLoaded {len(pending_rows)} pending trade(s) from Supabase.')
+    except Exception as e:
+        print(f'  Supabase unavailable ({e}) — falling back to CSV.')
 
-    print(f'\nFound {len(pending)} pending bet(s). Fetching box scores...\n')
+    if not pending_rows:
+        df      = _load_trades()
+        pending = df[df['result'] == 'PENDING']
+        if pending.empty:
+            print('No pending bets to resolve.')
+            return
+        pending_rows = pending.to_dict('records')
+        source       = 'csv'
+        print(f'\nLoaded {len(pending_rows)} pending trade(s) from CSV.')
 
-    # Fetch results for every unique date in the pending bets
-    dates = pending['date'].apply(lambda x: str(x)[:10]).unique()
+    print(f'Fetching box scores...\n')
+
+    # Fetch box scores for every unique bet date
+    date_key  = 'trade_date' if source == 'supabase' else 'date'
+    dates     = list({str(r[date_key])[:10] for r in pending_rows})
     box_scores = {}
     for date in dates:
         box_scores[date] = _fetch_pitcher_results(date)
         print(f'  {date}: box scores for {len(box_scores[date])} starting pitchers')
 
     print()
-    updated  = False
-    skipped  = []
+    updated = False
+    skipped = []
 
-    for idx, row in pending.iterrows():
-        date      = str(row['date'])[:10]
+    # Also load the CSV df so we can keep it in sync if it exists locally
+    df = _load_trades() if os.path.exists(TRADES_PATH) else None
+
+    for row in pending_rows:
+        date_val  = str(row[date_key])[:10]
         player    = row['player']
         side      = row['side']
         line      = float(row['line'])
@@ -447,7 +469,7 @@ def auto_resolve():
         stake     = float(row['stake'])
         odds      = float(row['odds'])
 
-        stats = _match_pitcher(player, box_scores.get(date, {}))
+        stats = _match_pitcher(player, box_scores.get(date_val, {}))
 
         if stats is None:
             skipped.append(player)
@@ -465,26 +487,30 @@ def auto_resolve():
             decimal = _american_to_decimal(odds)
             payout  = round(stake * decimal, 2)
             net     = round(payout - stake, 2)
-            df.at[idx, 'result'] = 'WIN'
-            df.at[idx, 'payout'] = payout
-            df.at[idx, 'net']    = net
+            result  = 'WIN'
             print(f'  WIN   {player:<24} {side} {line}  actual: {actual}  net: +${net:.2f}')
         else:
             payout = 0.0
             net    = -stake
-            df.at[idx, 'result'] = 'LOSS'
-            df.at[idx, 'payout'] = payout
-            df.at[idx, 'net']    = net
+            result = 'LOSS'
             print(f'  LOSS  {player:<24} {side} {line}  actual: {actual}  net: -${stake:.2f}')
 
+        # Update Supabase
         try:
             from database import update_paper_trade_result
-            update_paper_trade_result(
-                player, str(row['date'])[:10], side, line,
-                df.at[idx, 'result'], df.at[idx, 'payout'], df.at[idx, 'net']
-            )
+            update_paper_trade_result(player, date_val, side, line, result, payout, net)
         except Exception as e:
             print(f'    Supabase update error: {e}')
+
+        # Keep local CSV in sync if it exists
+        if df is not None:
+            mask = (
+                (df['player'] == player) &
+                (df['side'] == side) &
+                (df['line'].astype(float) == line) &
+                (df['result'] == 'PENDING')
+            )
+            df.loc[mask, ['result', 'payout', 'net']] = [result, payout, net]
 
         updated = True
 
@@ -494,8 +520,9 @@ def auto_resolve():
             print(f'    {p}')
 
     if updated:
-        df.to_csv(TRADES_PATH, index=False)
-        print('\nResults saved to paper_trades.csv')
+        if df is not None:
+            df.to_csv(TRADES_PATH, index=False)
+            print('\nResults saved to paper_trades.csv')
         print('Sending updated P&L to Discord...')
         send_pl_summary()
         print('Done.')

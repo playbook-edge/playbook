@@ -177,6 +177,23 @@ def log_paper_trade(trade: dict):
         print(f'  Supabase paper_trade insert error: {e}')
 
 
+def get_pending_trades() -> list:
+    """
+    Fetch all PENDING paper trades from Supabase.
+    Used by auto_resolve on Railway where paper_trades.csv doesn't persist.
+    Returns a list of dicts, or [] if Supabase is unavailable.
+    """
+    client = get_client()
+    if client is None:
+        return []
+    try:
+        resp = client.table('paper_trades').select('*').eq('result', 'PENDING').execute()
+        return resp.data or []
+    except Exception as e:
+        print(f'  Supabase get_pending_trades error: {e}')
+        return []
+
+
 def update_paper_trade_result(player: str, trade_date: str, side: str,
                                line: float, result: str,
                                payout: float, net: float):
