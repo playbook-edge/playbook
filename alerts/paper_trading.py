@@ -25,7 +25,7 @@ from datetime import datetime
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from config import DISCORD_WEBHOOK_PAPER, BANKROLL
+from config import DISCORD_WEBHOOK_PAPER, BANKROLL, ODDS_API_KEY
 
 TRADES_PATH     = os.path.join(os.path.dirname(__file__), '..', 'data', 'processed', 'paper_trades.csv')
 STARTING_BANKROLL = float(BANKROLL) if BANKROLL else 1000.0
@@ -182,8 +182,12 @@ def send_bet_placed(trade: dict, bankroll_after: float):
     _send_embed(embed, f'bet placed: {trade["player"]}')
 
 
-def send_pl_summary():
-    """Send a full P&L summary embed to the paper trading channel."""
+def send_pl_summary(avg_clv: float | None = None):
+    """
+    Send a full P&L summary embed to the paper trading channel.
+    avg_clv: optional average CLV across bets resolved tonight, as a decimal
+             (e.g. 0.018 = +1.8%).  Shown as a green/red line in the embed.
+    """
     from discord_webhook import DiscordEmbed
 
     stats = get_summary_stats()
@@ -231,6 +235,11 @@ def send_pl_summary():
         value='Awaiting results' if stats['pending'] > 0 else ('Profitable' if pl >= 0 else 'In the red'),
         inline=True
     )
+
+    # CLV line — only shown when auto_resolve captured closing odds tonight
+    if avg_clv is not None:
+        clv_str = f'{"🟢" if avg_clv >= 0 else "🔴"} Avg CLV: {avg_clv:+.1%}'
+        embed.add_embed_field(name='Closing Line Value', value=clv_str, inline=False)
 
     embed.set_footer(text=f'Playbook Paper Trading  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
     embed.set_timestamp()
@@ -500,9 +509,17 @@ def auto_resolve():
         box_scores[date] = _fetch_pitcher_results(date)
         print(f'  {date}: box scores for {len(box_scores[date])} starting pitchers')
 
+    # Fetch closing odds once — a single batch call before the resolve loop.
+    # At 11:30 PM most games have already started so the API typically returns
+    # nothing.  That is fine — we log null and move on.
+    today_str    = datetime.now().strftime('%Y-%m-%d')
+    print(f'\nFetching closing odds...')
+    closing_odds = _fetch_closing_odds(today_str)
+
     print()
-    updated = False
-    skipped = []
+    updated  = False
+    skipped  = []
+    clv_vals = []   # collect numeric CLV values to average at the end
 
     # Also load the CSV df so we can keep it in sync if it exists locally
     df = _load_trades() if os.path.exists(TRADES_PATH) else None
@@ -515,6 +532,7 @@ def auto_resolve():
         prop_type = str(row.get('prop_type', 'pitcher_strikeouts'))
         stake     = float(row['stake'])
         odds      = float(row['odds'])
+        book      = str(row.get('book', ''))
 
         stats = _match_pitcher(player, box_scores.get(date_val, {}))
 
@@ -542,12 +560,49 @@ def auto_resolve():
             result = 'LOSS'
             print(f'  LOSS  {player:<24} {side} {line}  actual: {actual}  net: -${stake:.2f}')
 
-        # Update Supabase
+        # Update Supabase paper trade result
         try:
             from database import update_paper_trade_result
             update_paper_trade_result(player, date_val, side, line, result, payout, net)
         except Exception as e:
             print(f'    Supabase update error: {e}')
+
+        # ── Closing line capture ─────────────────────────────────────────────
+        # Look up closing odds for this player.  closing_odds is empty at
+        # 11:30 PM when games are over — we log null and never block resolve.
+        closing_record = closing_odds.get(_normalize(player), {})
+        closing_side_odds_key = 'over_odds' if side == 'Over' else 'under_odds'
+        c_odds  = closing_record.get(closing_side_odds_key)   # None if unavailable
+
+        clv = None
+        if c_odds is not None:
+            try:
+                open_impl  = _american_to_implied_prob(float(odds))
+                close_impl = _american_to_implied_prob(float(c_odds))
+                # Positive CLV = closing line more expensive than our opening price.
+                # close_implied > open_implied means the book moved against bettors
+                # after we got in — we beat the close.
+                clv = round(close_impl - open_impl, 4)
+                clv_vals.append(clv)
+                print(f'    CLV   {player:<24} opening {int(odds):+d}  closing {int(c_odds):+d}  CLV: {clv:+.1%}')
+            except Exception:
+                pass
+
+        try:
+            from database import log_closing_line
+            log_closing_line({
+                'date':         date_val,
+                'player':       player,
+                'prop_type':    prop_type,
+                'line':         line,
+                'side':         side,
+                'opening_odds': int(odds),
+                'closing_odds': int(c_odds) if c_odds is not None else None,
+                'book':         book,
+                'clv_pct':      clv,
+            })
+        except Exception as e:
+            print(f'    Supabase closing_lines error (non-blocking): {e}')
 
         # Keep local CSV in sync if it exists
         if df is not None:
@@ -566,12 +621,18 @@ def auto_resolve():
         for p in skipped:
             print(f'    {p}')
 
+    avg_clv = round(sum(clv_vals) / len(clv_vals), 4) if clv_vals else None
+    if avg_clv is not None:
+        print(f'\n  Avg CLV tonight: {avg_clv:+.1%} across {len(clv_vals)} bet(s)')
+    else:
+        print('\n  Closing odds unavailable — CLV not calculated (games already in progress).')
+
     if updated:
         if df is not None:
             df.to_csv(TRADES_PATH, index=False)
             print('\nResults saved to paper_trades.csv')
         print('Sending updated P&L to Discord...')
-        send_pl_summary()
+        send_pl_summary(avg_clv=avg_clv)
         print('Done.')
     else:
         print('\nNo bets resolved — all games may still be in progress.')
@@ -601,6 +662,89 @@ def _american_to_decimal(american_odds: float) -> float:
         return (american_odds / 100) + 1
     else:
         return (100 / abs(american_odds)) + 1
+
+
+def _american_to_implied_prob(odds: float) -> float:
+    """Convert American odds to implied probability (includes vig)."""
+    if odds >= 0:
+        return 100 / (odds + 100)
+    else:
+        return abs(odds) / (abs(odds) + 100)
+
+
+def _fetch_closing_odds(date_str: str) -> dict:
+    """
+    Attempt to pull current market odds from the Odds API for all of today's
+    MLB games.  At 11:30 PM most games have started so the API will return
+    no bookmakers — that is expected and handled gracefully.
+
+    Returns: { normalized_player_name: {'over_odds': int, 'under_odds': int} }
+    Returns {} on any error or if no odds are available.
+    """
+    if not ODDS_API_KEY:
+        return {}
+
+    BASE   = 'https://api.the-odds-api.com/v4'
+    SPORT  = 'baseball_mlb'
+    BOOKS  = 'draftkings,fanduel,betmgm'
+
+    closing = {}
+    try:
+        # Get today's events
+        resp = requests.get(
+            f'{BASE}/sports/{SPORT}/events',
+            params={'apiKey': ODDS_API_KEY, 'dateFormat': 'iso'},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        events = [e for e in resp.json() if e.get('commence_time', '')[:10] == date_str]
+        print(f'  Closing odds: {len(events)} event(s) found for {date_str}')
+
+        for event in events:
+            eid  = event['id']
+            home = event.get('home_team', '')
+            away = event.get('away_team', '')
+            try:
+                r = requests.get(
+                    f'{BASE}/sports/{SPORT}/events/{eid}/odds',
+                    params={
+                        'apiKey':     ODDS_API_KEY,
+                        'markets':    'pitcher_strikeouts',
+                        'bookmakers': BOOKS,
+                        'oddsFormat': 'american',
+                    },
+                    timeout=10,
+                )
+                if r.status_code == 422:
+                    continue   # no props market for this game
+                r.raise_for_status()
+
+                for book in r.json().get('bookmakers', []):
+                    for market in book.get('markets', []):
+                        if market['key'] != 'pitcher_strikeouts':
+                            continue
+                        player_data = {}
+                        for outcome in market.get('outcomes', []):
+                            pname = _normalize(outcome.get('description', ''))
+                            side  = outcome.get('name', '')
+                            price = outcome.get('price')
+                            if pname not in player_data:
+                                player_data[pname] = {}
+                            if side == 'Over':
+                                player_data[pname]['over_odds']  = price
+                            elif side == 'Under':
+                                player_data[pname]['under_odds'] = price
+                        for pname, odds in player_data.items():
+                            if pname not in closing:   # first book wins
+                                closing[pname] = odds
+            except Exception:
+                continue   # bad event — skip, don't block resolve
+
+    except Exception as e:
+        print(f'  Closing odds fetch error (non-blocking): {e}')
+
+    print(f'  Closing odds captured for {len(closing)} pitcher(s).')
+    return closing
 
 
 def resolve_pending():

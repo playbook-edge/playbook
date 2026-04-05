@@ -1,9 +1,10 @@
 """
 database.py — Supabase client and write functions for Playbook.
 
-Three tables (created in Supabase SQL editor):
+Four tables (created in Supabase SQL editor):
   ev_signals    — every flagged EV signal found by the model, every day
   paper_trades  — every paper bet placed and its result
+  closing_lines — closing odds captured at resolve time for CLV tracking
   pipeline_runs — log of each daily pipeline execution
 
 All functions degrade gracefully: if SUPABASE_URL / SUPABASE_KEY are not
@@ -216,6 +217,49 @@ def update_paper_trade_result(player: str, trade_date: str, side: str,
                .execute())
     except Exception as e:
         print(f'  Supabase paper_trade update error: {e}')
+
+
+# ─────────────────────────────────────────────
+# closing_lines
+# ─────────────────────────────────────────────
+
+def log_closing_line(record: dict):
+    """
+    Insert one closing line record into the closing_lines table.
+
+    Expected keys:
+      date          — trade date (YYYY-MM-DD)
+      player        — pitcher name
+      prop_type     — 'pitcher_strikeouts' or 'pitcher_innings'
+      line          — prop line (e.g. 5.5)
+      side          — 'Over' or 'Under'
+      opening_odds  — American odds we bet at (e.g. -110)
+      closing_odds  — American odds at market close (None if unavailable)
+      book          — sportsbook name
+      clv_pct       — closing_implied_prob - opening_implied_prob
+                      Positive = we got a better price than the closing line.
+                      None if closing_odds is unavailable.
+    """
+    client = get_client()
+    if client is None:
+        return
+
+    row = {
+        'date':         _clean(record.get('date')),
+        'player':       _clean(record.get('player')),
+        'prop_type':    _clean(record.get('prop_type')),
+        'line':         _clean(record.get('line')),
+        'side':         _clean(record.get('side')),
+        'opening_odds': _clean(record.get('opening_odds')),
+        'closing_odds': _clean(record.get('closing_odds')),
+        'book':         _clean(record.get('book')),
+        'clv_pct':      _clean(record.get('clv_pct')),
+    }
+
+    try:
+        client.table('closing_lines').insert(row).execute()
+    except Exception as e:
+        print(f'  Supabase closing_lines insert error: {e}')
 
 
 # ─────────────────────────────────────────────
