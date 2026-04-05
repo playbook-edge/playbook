@@ -285,6 +285,13 @@ def log_bets_from_signals(signals_df: pd.DataFrame,
 
         _save_trade(trade)
         send_bet_placed(trade, bankroll_after)
+
+        try:
+            from database import log_paper_trade
+            log_paper_trade(trade)
+        except Exception as e:
+            print(f'    Supabase log error: {e}')
+
         bankroll = bankroll_after
         placed += 1
 
@@ -463,10 +470,21 @@ def auto_resolve():
             df.at[idx, 'net']    = net
             print(f'  WIN   {player:<24} {side} {line}  actual: {actual}  net: +${net:.2f}')
         else:
+            payout = 0.0
+            net    = -stake
             df.at[idx, 'result'] = 'LOSS'
-            df.at[idx, 'payout'] = 0.0
-            df.at[idx, 'net']    = -stake
+            df.at[idx, 'payout'] = payout
+            df.at[idx, 'net']    = net
             print(f'  LOSS  {player:<24} {side} {line}  actual: {actual}  net: -${stake:.2f}')
+
+        try:
+            from database import update_paper_trade_result
+            update_paper_trade_result(
+                player, str(row['date'])[:10], side, line,
+                df.at[idx, 'result'], df.at[idx, 'payout'], df.at[idx, 'net']
+            )
+        except Exception as e:
+            print(f'    Supabase update error: {e}')
 
         updated = True
 
@@ -542,10 +560,22 @@ def resolve_pending():
             df.at[idx, 'net']    = net
             print(f'    WIN  —  returned ${payout:.2f}  (net +${net:.2f})\n')
         else:
+            payout = 0.0
+            net    = -float(row['stake'])
             df.at[idx, 'result'] = 'LOSS'
-            df.at[idx, 'payout'] = 0.0
-            df.at[idx, 'net']    = -float(row['stake'])
+            df.at[idx, 'payout'] = payout
+            df.at[idx, 'net']    = net
             print(f'    LOSS  —  net -${float(row["stake"]):.2f}\n')
+
+        try:
+            from database import update_paper_trade_result
+            update_paper_trade_result(
+                row['player'], str(row['date'])[:10], row['side'],
+                float(row['line']), df.at[idx, 'result'],
+                df.at[idx, 'payout'], df.at[idx, 'net']
+            )
+        except Exception as e:
+            print(f'    Supabase update error: {e}')
 
         updated = True
 

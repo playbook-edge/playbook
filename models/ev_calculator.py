@@ -704,6 +704,14 @@ def run():
     except Exception as e:
         print(f'  Paper trading error: {e}')
 
+    # --- Log to Supabase ---
+    print(f'\n--- Logging to Supabase ---')
+    try:
+        from database import log_ev_signals
+        log_ev_signals(signals)
+    except Exception as e:
+        print(f'  Supabase error: {e}')
+
 
 if __name__ == '__main__':
     run()

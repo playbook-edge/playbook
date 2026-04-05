@@ -204,10 +204,9 @@ Boyd) are all pitchers tracking UP vs history — a much stronger foundation.
 
 ## What to Build Next (rough order)
 
-1. **Batter matchup context** — add opposing team K-rate (from team_krates.csv) into the prop signal
+1. **Railway deployment** — move pipeline execution to the cloud (replaces Windows Task Scheduler)
 2. **Claude AI analysis** — prompt Claude with the full signal context, get a plain-English write-up
-3. **Supabase logging** — store signals and track bet outcomes over time
-4. **Batter props** — expand beyond pitchers to hit/HR/RBI props
+3. **Batter props** — expand beyond pitchers to hit/HR/RBI props
 
 ---
 

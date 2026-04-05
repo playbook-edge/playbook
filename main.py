@@ -163,6 +163,19 @@ def main():
     logger.log('=' * 50)
 
     send_pipeline_summary(logger, results)
+
+    # Log run to Supabase
+    try:
+        from database import log_pipeline_run
+        log_pipeline_run(
+            run_date     = datetime.now().date(),
+            steps_passed = passed,
+            steps_failed = 6 - passed,
+            notes        = ', '.join(f'{k}: {v["note"]}' for k, v in results.items() if not v['ok'])
+        )
+    except Exception as e:
+        logger.log(f'  Supabase pipeline log error: {e}')
+
     logger.close()
 
 
