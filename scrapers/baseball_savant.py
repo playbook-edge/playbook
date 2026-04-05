@@ -29,7 +29,8 @@ from pybaseball import cache
 
 cache.enable()
 
-OUTPUT_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw', 'savant_today.csv')
+OUTPUT_PATH    = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw', 'savant_today.csv')
+HIST_STATS_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'historical', 'pitcher_stats_all.csv')
 DELAY = 2   # seconds between Statcast requests
 FASTBALL_TYPES = {'FF', 'FT', 'SI', 'FC', 'FS'}  # pitch types treated as fastballs
 
@@ -72,7 +73,107 @@ def get_todays_starters():
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Try to get xFIP from FanGraphs for the season so far
+# Step 2a: Fetch average innings per start from the MLB Stats API
+#           Uses inningsPitched / gamesStarted for the current 2026 season.
+#           Falls back to 2-year historical average, then 5.5 if no data.
+# ---------------------------------------------------------------------------
+
+def _parse_ip(ip_str) -> float:
+    """
+    Convert MLB Stats API innings string to true decimal innings.
+    MLB uses X.Y where Y is outs (0/1/2), not tenths.
+    '33.2' = 33 innings + 2 outs = 33.667 innings, not 33.2.
+    """
+    try:
+        parts = str(ip_str).split('.')
+        whole = int(parts[0])
+        outs  = int(parts[1]) if len(parts) > 1 else 0
+        return whole + outs / 3
+    except Exception:
+        return float(ip_str) if ip_str else 0.0
+
+
+def _build_hist_ip_lookup() -> dict:
+    """
+    Build a name → avg IP/start dict from pitcher_stats_all.csv (2024+2025).
+    Weighted average: 2025 counts 2x, 2024 counts 1x.
+    Returns empty dict if file not found.
+    """
+    try:
+        df = pd.read_csv(os.path.normpath(HIST_STATS_PATH))
+        df = df[df['GS'] > 0].copy()
+        df['ip_per_start'] = df['IP'] / df['GS']
+        df['_name_lower']  = df['Name'].str.lower().str.strip()
+        df['_weight']      = df['Season'].apply(lambda s: 2 if s == 2025 else 1)
+
+        lookup = {}
+        for name_lower, group in df.groupby('_name_lower'):
+            total_w   = (group['ip_per_start'] * group['_weight']).sum()
+            weight_sum = group['_weight'].sum()
+            lookup[name_lower] = round(total_w / weight_sum, 2)
+        return lookup
+    except Exception:
+        return {}
+
+
+def _hist_ip_for(name: str, hist_lookup: dict) -> float | None:
+    """Look up historical avg IP/start by name, trying last-name fallback."""
+    name_lower = name.lower().strip()
+    if name_lower in hist_lookup:
+        return hist_lookup[name_lower]
+    last = name_lower.split()[-1]
+    for k, v in hist_lookup.items():
+        if k.endswith(last):
+            return v
+    return None
+
+
+def fetch_avg_ip(mlb_id, name, hist_lookup: dict) -> tuple[float, float | None]:
+    """
+    Returns (avg_ip, hist_avg_ip) for a pitcher.
+
+    avg_ip      — current 2026 season IP/GS from MLB Stats API.
+                  Falls back to hist_avg_ip, then 5.5 if API returns 0 starts.
+    hist_avg_ip — weighted 2024+2025 average IP/start (None if not in history).
+
+    Both values are returned so ev_calculator can blend them for early-season
+    starts the same way it blends K/9.
+    """
+    DEFAULT_IP  = 5.5
+    hist_ip     = _hist_ip_for(name, hist_lookup)
+    current_ip  = None
+
+    try:
+        url  = (
+            f"https://statsapi.mlb.com/api/v1/people/{mlb_id}"
+            f"?hydrate=stats(group=pitching,type=season,season=2026)"
+        )
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for stat_group in data.get('people', [{}])[0].get('stats', []):
+            splits = stat_group.get('splits', [])
+            if not splits:
+                continue
+            stat = splits[0].get('stat', {})
+            gs   = int(stat.get('gamesStarted', 0))
+            if gs > 0:
+                ip = _parse_ip(stat.get('inningsPitched', '0'))
+                current_ip = round(ip / gs, 2)
+                break
+    except Exception as e:
+        print(f"    avg_ip API error for {name}: {e}")
+
+    # If no current starts yet, fall back to historical then default
+    if current_ip is None:
+        current_ip = hist_ip if hist_ip is not None else DEFAULT_IP
+
+    return current_ip, hist_ip
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: Try to get xFIP from FanGraphs for the season so far
 #         (used to enrich the Statcast data; gracefully skipped if unavailable)
 # ---------------------------------------------------------------------------
 
@@ -191,7 +292,11 @@ def run():
         print("\nNo games scheduled today. Nothing to scrape.")
         return
 
-    # 2. FanGraphs xFIP (best-effort)
+    # 2. Historical IP lookup (for avg_ip fallback)
+    hist_ip = _build_hist_ip_lookup()
+    print(f"  Loaded historical IP averages for {len(hist_ip)} pitchers.")
+
+    # 3. FanGraphs xFIP (best-effort)
     fg_df = get_fangraphs_xfip()
 
     def lookup_xfip(name):
@@ -207,37 +312,41 @@ def run():
             return round(float(val), 2) if pd.notna(val) else None
         return None
 
-    # 3. Per-pitcher Statcast stats
+    # 4. Per-pitcher Statcast stats + avg IP from MLB Stats API
     print(f"\nFetching Statcast data for {len(starters)} pitchers "
           f"({START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')})...")
-    print(f"  (5-second delay between requests)\n")
+    print(f"  (2-second delay between requests)\n")
 
     rows = []
     for i, p in enumerate(starters, 1):
         print(f"  [{i}/{len(starters)}] {p['name']} — {p['team']}")
-        sc_data = fetch_pitcher_statcast(p['mlb_id'], p['name'])
-        metrics = compute_metrics(sc_data)
+        sc_data              = fetch_pitcher_statcast(p['mlb_id'], p['name'])
+        metrics              = compute_metrics(sc_data)
+        avg_ip, hist_avg_ip  = fetch_avg_ip(p['mlb_id'], p['name'], hist_ip)
+        print(f"    avg_ip = {avg_ip} IP/start  (hist: {hist_avg_ip})")
         rows.append({
-            'name':       p['name'],
-            'team':       p['team'],
-            'throws':     p.get('throws', 'R'),
-            'k_pct':      metrics['k_pct'],
-            'xfip':       lookup_xfip(p['name']),
-            'velo':       metrics['velo'],
-            'velo_trend': metrics['velo_trend'],
-            'spin_rate':  metrics['spin_rate'],
-            'pitch_mix':  metrics['pitch_mix'],
-            'babip':      metrics['babip'],
+            'name':         p['name'],
+            'team':         p['team'],
+            'throws':       p.get('throws', 'R'),
+            'k_pct':        metrics['k_pct'],
+            'xfip':         lookup_xfip(p['name']),
+            'velo':         metrics['velo'],
+            'velo_trend':   metrics['velo_trend'],
+            'spin_rate':    metrics['spin_rate'],
+            'pitch_mix':    metrics['pitch_mix'],
+            'babip':        metrics['babip'],
+            'avg_ip':       avg_ip,
+            'hist_avg_ip':  hist_avg_ip,
         })
 
     report = pd.DataFrame(rows)
 
-    # 4. Save
+    # 5. Save
     out_path = os.path.normpath(OUTPUT_PATH)
     report.to_csv(out_path, index=False)
     print(f"\nSaved to: {out_path}")
 
-    # 5. Summary
+    # 6. Summary
     found = report['k_pct'].notna().sum()
     print(f"\n{'='*55}")
     print(f"  Summary")

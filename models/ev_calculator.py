@@ -433,6 +433,30 @@ def build_ev_signals(props_df:    pd.DataFrame,
             pm = sv_row.get('pitch_mix')
             if pm is not None and pd.notna(pm):
                 pitch_mix = str(pm)
+            # Blend current avg_ip with historical, using the same early-season
+            # schedule as K/9.  This prevents a pitcher with 2 short starts
+            # from collapsing expected innings far below their true baseline.
+            #
+            # <4 starts : 92% hist, 8% current
+            # 4–6 starts: 80% hist, 20% current
+            # 7–9 starts: ramp from 80% → 30% historical
+            # 10+ starts : trust current data fully
+            ai      = sv_row.get('avg_ip')
+            hist_ai = sv_row.get('hist_avg_ip')
+            if ai is not None and pd.notna(ai) and float(ai) > 0:
+                if hist_ai is not None and pd.notna(hist_ai) and float(hist_ai) > 0:
+                    if curr_starts < 4:
+                        hist_w = 0.92
+                    elif curr_starts <= 6:
+                        hist_w = 0.80
+                    elif curr_starts <= 9:
+                        ramp   = (curr_starts - 6) / 3   # 0→1 over starts 7–9
+                        hist_w = 0.80 - ramp * 0.50       # 0.80 → 0.30
+                    else:
+                        hist_w = 0.0
+                    ip_per_start = round((1 - hist_w) * float(ai) + hist_w * float(hist_ai), 2)
+                else:
+                    ip_per_start = float(ai)
 
         # ── Velocity trend adjustment ─────────────────────────────────────────
         # Compares last 7 days of fastball velo vs the full 30-day avg.
