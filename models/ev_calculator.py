@@ -250,6 +250,12 @@ def build_ev_signals(props_df: pd.DataFrame,
         kelly_over  = kelly_stake(model_over,  over_odds,  bankroll)
         kelly_under = kelly_stake(model_under, under_odds, bankroll)
 
+        # Pull xFIP for the Discord embed (nice-to-have, not required)
+        xfip_val = None
+        if stats_name:
+            st = stats_df[stats_df['name'] == stats_name].iloc[0]
+            xfip_val = st.get('xfip') if pd.notna(st.get('xfip')) else None
+
         base = {
             'player':       player,
             'matchup':      prop.get('matchup', ''),
@@ -258,6 +264,7 @@ def build_ev_signals(props_df: pd.DataFrame,
             'expected_ks':  round(expected_ks, 2),
             'k9_used':      round(k9, 2),
             'ip_per_start': round(ip_per_start, 1),
+            'xfip':         xfip_val,
         }
 
         # Over row
@@ -425,6 +432,14 @@ def run():
         print(f'\n  NOTE: Synthetic props are generated from each pitcher\'s K/9.')
         print(f'  Lines are set at expected Ks; odds are randomised. Real props')
         print(f'  will show different lines and tighter edges.')
+
+    # --- Fire Discord alerts ---
+    print(f'\n--- Firing Discord Alerts ---')
+    try:
+        from alerts.discord_alerts import fire_alerts_from_signals
+        fire_alerts_from_signals(signals, ev_threshold=EV_THRESHOLD, max_alerts=5)
+    except Exception as e:
+        print(f'  Alert error: {e}')
 
 
 if __name__ == '__main__':
