@@ -392,12 +392,20 @@ def build_ev_signals(props_df:    pd.DataFrame,
                 # Base weight from reliability (30–50% historical)
                 base_hist = 0.30 + (hist_reliability / 100) * 0.20
 
-                # Early-season bonus: fewer starts = lean much harder on history.
-                # 1 start → +40% to hist weight, 10+ starts → no bonus.
-                # Prevents 1-2 start K/9 noise from creating fake DEGEN signals.
-                early_bonus = max(0.0, (1.0 - curr_starts / 10.0)) * 0.40
+                # Early-season blending — hard floors on historical weight
+                # to prevent tiny samples from distorting the model.
+                # <4 starts : 92% historical, 8% current
+                # 4-6 starts: 80% historical, 20% current
+                # 7-9 starts: ramp from base_hist + early_bonus toward normal
+                # 10+ starts: normal reliability-based weight (no floor)
+                if curr_starts < 4:
+                    hist_weight = 0.92
+                elif curr_starts <= 6:
+                    hist_weight = 0.80
+                else:
+                    early_bonus = max(0.0, (1.0 - curr_starts / 10.0)) * 0.40
+                    hist_weight = min(base_hist + early_bonus, 0.85)
 
-                hist_weight = min(base_hist + early_bonus, 0.85)
                 curr_weight = 1 - hist_weight
                 blended_k9  = curr_weight * k9 + hist_weight * hist_k9
 
@@ -468,6 +476,32 @@ def build_ev_signals(props_df:    pd.DataFrame,
             model_over  = prob_over_line(expected_ks, line)
             model_under = prob_under_line(expected_ks, line)
 
+        # ── Fix 3: Low line confidence reduction ─────────────────────────────
+        # Very low strikeout lines (≤3.5) are highly sensitive to small
+        # changes in game script (early hook, rain delay, quick inning).
+        # We discount the model probability to avoid over-betting these.
+        # ≤2.5 line → multiply by 0.80  |  ≤3.5 line → multiply by 0.88
+        low_line_note = None
+        if prop_type == 'pitcher_strikeouts':
+            if line <= 2.5:
+                model_over  = round(model_over  * 0.80, 4)
+                model_under = round(model_under * 0.80, 4)
+                low_line_note = 'Low line discount 0.80x (line <= 2.5)'
+            elif line <= 3.5:
+                model_over  = round(model_over  * 0.88, 4)
+                model_under = round(model_under * 0.88, 4)
+                low_line_note = 'Low line discount 0.88x (line <= 3.5)'
+
+        # ── Fix 1: Model probability ceiling ─────────────────────────────────
+        # Cap any single-side probability at 75% before it enters EV.
+        # Poisson can output near-certainty on easy lines but those
+        # estimates are unreliable — no prop is a lock.
+        PROB_CEILING = 0.75
+        over_capped  = model_over  > PROB_CEILING
+        under_capped = model_under > PROB_CEILING
+        model_over   = min(model_over,  PROB_CEILING)
+        model_under  = min(model_under, PROB_CEILING)
+
         book_over_prob, book_under_prob = remove_vig(over_odds, under_odds)
 
         ev_over  = calculate_ev(model_over,  over_odds)
@@ -503,6 +537,7 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'opp_team':         opp_team,
             'opp_k_pct':        opp_k_pct,
             'matchup_factor':   matchup_factor,
+            'low_line_note':    low_line_note,
         }
 
         # Over row
@@ -515,6 +550,7 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'kelly_pct':     kelly_over['fraction'],
             'kelly_dollars': kelly_over['dollars'],
             'flag':          ev_over >= EV_THRESHOLD,
+            'prob_capped':   over_capped,
         })
 
         # Under row
@@ -527,6 +563,7 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'kelly_pct':     kelly_under['fraction'],
             'kelly_dollars': kelly_under['dollars'],
             'flag':          ev_under >= EV_THRESHOLD,
+            'prob_capped':   under_capped,
         })
 
     df = pd.DataFrame(rows)
