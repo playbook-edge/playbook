@@ -79,13 +79,15 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 - For each pitcher: calls `pybaseball.statcast_pitcher()` for last-30-day pitch data
 - Computes K%, fastball velocity, BABIP from raw Statcast rows
 - Tries FanGraphs xFIP via `pitching_stats_range()` — fails early in season (empty table), xFIP shows None until ~mid-April
-- 5-second delay between requests; pybaseball cache enabled
+- 2-second delay between requests (reduced from 5s for Railway speed); pybaseball cache enabled
+- Captures pitcher throwing hand (R/L) from MLB Stats API, saved to savant_today.csv as `throws` column
 - **Known quirk**: accented names (e.g. Vásquez) print garbled in Windows terminal — data in CSV is correct
 
 ### `scrapers/fangraphs.py` — WORKING
 - Team strikeout rates by batter handedness (vs RHP / vs LHP) from Statcast
 - Current season pitching leaderboard: xFIP, FIP, K/9, BB/9, BABIP
 - Batting team derived from `home_team`/`away_team` + `inning_topbot` (no direct column)
+- **Supabase caching**: team K-rates cached daily — skips full Statcast pull if already fetched today (saves 2-5 min on Railway)
 
 ### `scrapers/historical_stats.py` — WORKING
 - Pulls full 2024 and 2025 FanGraphs season stats via `pitching_stats(year, year, qual=0)`
@@ -107,6 +109,7 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 - **Trend arrows**: UP / DOWN / STABLE / NEW — compares current season to historical average
 - Uses fuzzy name matching (SequenceMatcher) to handle minor spelling differences across sources
 - Output: 935 pitcher baselines as of April 2026
+- **Supabase caching**: baselines cached in `player_baselines_cache` table — skips rebuild if cache under 7 days old (saves 1-2 min on Railway)
 
 ### `models/ev_calculator.py` — WORKING
 - **Pure math layer**: American odds conversion, EV formula, Kelly Criterion (half-Kelly, capped 5%)
@@ -114,7 +117,8 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 - **Historical blending**: blends current K/9 with historical baseline
   - High-reliability pitchers (90+): ~50% historical, ~50% current
   - Low-reliability/new pitchers: ~70% current, ~30% historical
-  - This prevents small-sample flukes from dominating signals
+  - **Starts-aware early-season adjustment**: 1 start = 85% historical, ramps to normal by 10 starts — prevents early-April noise from inflating EV
+- **Batter matchup context**: scales expected Ks by opposing lineup K-rate vs pitcher handedness (▲/▼ shown in Discord)
 - **Synthetic props fallback**: when no live props exist, generates lines from K/9 for testing
 - Flags any prop above 4% EV; saves full results to `ev_signals.csv`
 
@@ -202,11 +206,30 @@ Boyd) are all pitchers tracking UP vs history — a much stronger foundation.
 
 ---
 
+## Deployment
+
+- **Railway**: pipeline runs daily at 10:30 AM ET via cron (`30 14 * * *`)
+  - Repo: `playbook-edge/playbook`, branch: master
+  - Env vars set in Railway dashboard (same as .env)
+  - `railway.json` configures Nixpacks build + `python main.py` start command
+- **Windows Task Scheduler**: `resolve_trades.bat` runs `auto_resolve` at 11:30 PM ET nightly
+  - Keep this running — Railway handles the pipeline, Windows handles the resolve
+
+## Supabase Tables
+
+| Table | Purpose | Refresh |
+|-------|---------|---------|
+| `ev_signals` | Every flagged bet the model finds | Daily |
+| `paper_trades` | Simulated bets + WIN/LOSS results | Per bet |
+| `pipeline_runs` | Log of each daily execution | Daily |
+| `team_krates_cache` | Team K% vs RHP/LHP | Daily |
+| `player_baselines_cache` | 935-pitcher historical composites | Weekly |
+
 ## What to Build Next (rough order)
 
-1. **Railway deployment** — move pipeline execution to the cloud (replaces Windows Task Scheduler)
-2. **Claude AI analysis** — prompt Claude with the full signal context, get a plain-English write-up
-3. **Batter props** — expand beyond pitchers to hit/HR/RBI props
+1. **Claude AI analysis** — wire in ANTHROPIC_API_KEY for plain-English bet rationale (key not set yet)
+2. **Batter props** — expand beyond pitchers to hit/HR/RBI props
+3. **Result accuracy tracking** — measure model calibration as the season progresses
 
 ---
 
