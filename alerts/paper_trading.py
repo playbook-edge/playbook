@@ -443,11 +443,58 @@ def auto_resolve():
         source       = 'csv'
         print(f'\nLoaded {len(pending_rows)} pending trade(s) from CSV.')
 
-    print(f'Fetching box scores...\n')
+    date_key = 'trade_date' if source == 'supabase' else 'date'
+
+    # ── Remove stale pending trades (from a previous day) ────────────────────
+    # A trade that is still PENDING the morning after its game date will never
+    # resolve cleanly. Drop it now so it doesn't pollute the record.
+    today_str   = datetime.now().strftime('%Y-%m-%d')
+    stale_rows  = [r for r in pending_rows if str(r[date_key])[:10] < today_str]
+    pending_rows = [r for r in pending_rows if str(r[date_key])[:10] >= today_str]
+
+    if stale_rows:
+        print(f'\nRemoving {len(stale_rows)} stale pending trade(s) from previous day(s):')
+        for r in stale_rows:
+            print(f'  {r["player"]}  ({str(r[date_key])[:10]})')
+            try:
+                from database import update_paper_trade_result
+                update_paper_trade_result(
+                    r['player'], str(r[date_key])[:10],
+                    r['side'], float(r['line']),
+                    'EXPIRED', 0.0, 0.0
+                )
+            except Exception as e:
+                print(f'    Supabase remove error: {e}')
+
+        # Remove from local CSV
+        df = _load_trades() if os.path.exists(TRADES_PATH) else None
+        if df is not None:
+            for r in stale_rows:
+                mask = (
+                    (df['player'] == r['player']) &
+                    (df['result'] == 'PENDING') &
+                    (df['date'].astype(str).str[:10] < today_str)
+                )
+                df = df[~mask]
+            df.to_csv(TRADES_PATH, index=False)
+            print(f'  Stale trades removed from CSV.')
+
+    if not pending_rows:
+        print('\nNo active pending bets to resolve.')
+        # Still send heartbeat so health channel knows the bot ran
+        try:
+            from alerts.discord_alerts import send_heartbeat
+            stats = get_summary_stats()
+            send_heartbeat(game_count=0, pending_trades=0,
+                           wins=stats['wins'], losses=stats['losses'])
+        except Exception as e:
+            print(f'  Heartbeat error: {e}')
+        return
+
+    print(f'\nFetching box scores...\n')
 
     # Fetch box scores for every unique bet date
-    date_key  = 'trade_date' if source == 'supabase' else 'date'
-    dates     = list({str(r[date_key])[:10] for r in pending_rows})
+    dates = list({str(r[date_key])[:10] for r in pending_rows})
     box_scores = {}
     for date in dates:
         box_scores[date] = _fetch_pitcher_results(date)
@@ -532,8 +579,14 @@ def auto_resolve():
     # Send daily heartbeat to health channel
     try:
         from alerts.discord_alerts import send_heartbeat
+        stats      = get_summary_stats()
         game_count = sum(len(v) for v in box_scores.values())
-        send_heartbeat(game_count=game_count, pending_trades=len(skipped))
+        send_heartbeat(
+            game_count=game_count,
+            pending_trades=len(skipped),
+            wins=stats['wins'],
+            losses=stats['losses'],
+        )
     except Exception as e:
         print(f'  Heartbeat error: {e}')
 

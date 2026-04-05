@@ -566,23 +566,28 @@ def send_error_alert(step_name: str, error_message: str):
     hook.execute()
 
 
-def send_heartbeat(game_count: int, pending_trades: int):
+def send_heartbeat(game_count: int, pending_trades: int,
+                   wins: int = 0, losses: int = 0):
     """
     Send a daily alive-check to the health channel.
     Confirms the bot is running, how many games are on today,
-    and how many paper trades are still waiting for a result.
+    how many paper trades are still pending, and the season W/L record.
 
     Always prints a terminal preview. Sends to Discord only if
     DISCORD_WEBHOOK_HEALTH is configured.
     """
     from discord_webhook import DiscordWebhook, DiscordEmbed
 
-    title = '✅  Playbook is alive'
+    title    = '✅  Playbook is alive'
+    resolved = wins + losses
+    win_pct  = f'{wins / resolved:.1%}' if resolved > 0 else 'N/A'
+    record   = f'{wins}W – {losses}L ({win_pct})'
 
     print('\n' + '-' * 50)
     print('  HEALTH EMBED PREVIEW -- send_heartbeat')
     print('-' * 50)
     print(f'  Title          : [OK] Playbook is alive')
+    print(f'  Record         : {record}')
     print(f'  Games today    : {game_count}')
     print(f'  Pending trades : {pending_trades}')
     print(f'  Next pipeline  : Tomorrow 10:30 AM ET')
@@ -591,14 +596,17 @@ def send_heartbeat(game_count: int, pending_trades: int):
 
     url = DISCORD_WEBHOOK_HEALTH
     if not url:
-        print('  DISCORD_WEBHOOK_HEALTH not set — preview only, not sent.\n')
+        print('  DISCORD_WEBHOOK_HEALTH not set -- preview only, not sent.\n')
         return
 
     hook  = DiscordWebhook(url=url, rate_limit_retry=True)
     embed = DiscordEmbed(title=title, color=0x2ECC71)
-    embed.add_embed_field(name='Games today',    value=str(game_count),          inline=True)
+    embed.add_embed_field(name='Season Record',  value=record,                   inline=True)
     embed.add_embed_field(name='Pending trades', value=str(pending_trades),      inline=True)
     embed.add_embed_field(name='Next pipeline',  value='Tomorrow 10:30 AM ET',   inline=True)
+    embed.add_embed_field(name='Games today',    value=str(game_count),          inline=True)
+    embed.add_embed_field(name='Wins',           value=str(wins),                inline=True)
+    embed.add_embed_field(name='Losses',         value=str(losses),              inline=True)
     embed.set_footer(text=f'Playbook Health  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
     embed.set_timestamp()
     hook.add_embed(embed)
