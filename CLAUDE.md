@@ -83,6 +83,8 @@ After all 6 steps, `send_pipeline_summary()` fires to the health channel.
 - Tries FanGraphs xFIP via `pitching_stats_range()` — fails early in season (empty table), xFIP shows None until ~mid-April
 - 2-second delay between requests; pybaseball cache enabled
 - Captures pitcher throwing hand (R/L) from MLB Stats API, saved as `throws` column
+- **avg_ip**: calls `statsapi.mlb.com/api/v1/people/{id}?hydrate=stats(...)` per starter to get current 2026 IP/GS; stored as `avg_ip` in savant_today.csv
+- **hist_avg_ip**: weighted 2024+2025 average IP/start from pitcher_stats_all.csv; stored alongside `avg_ip` for blending
 - **Known quirk**: accented names (e.g. Vásquez) print garbled in Windows terminal — data in CSV is correct
 
 ### `scrapers/fangraphs.py` — WORKING
@@ -116,6 +118,7 @@ After all 6 steps, `send_pipeline_summary()` fires to the health channel.
 ### `models/ev_calculator.py` — WORKING
 - **Pure math layer**: American odds conversion, EV formula, Kelly Criterion (half-Kelly, capped 5%)
 - **Poisson model**: converts K/9 + expected IP into probability of going over/under any line
+- **Per-pitcher innings**: uses `avg_ip` from savant_today.csv (current 2026 IP/GS from MLB Stats API) blended against `hist_avg_ip` (2yr historical) — same early-season schedule as K/9 blending. Replaces the old fixed 5.5-inning default.
 - **Historical blending** (starts-aware hard floors):
   - 0–3 starts: 92% historical, 8% current
   - 4–6 starts: 80% historical, 20% current
