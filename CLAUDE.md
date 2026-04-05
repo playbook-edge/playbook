@@ -118,6 +118,16 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 - **Synthetic props fallback**: when no live props exist, generates lines from K/9 for testing
 - Flags any prop above 4% EV; saves full results to `ev_signals.csv`
 
+### `alerts/paper_trading.py` — WORKING
+- Logs every flagged bet to `data/processed/paper_trades.csv` (called automatically by ev_calculator)
+- Sends "BET PLACED" embed to `DISCORD_WEBHOOK_PAPER` channel for each trade
+- Sends running P&L summary embed after all bets are placed
+- **Auto-resolve**: `python alerts/paper_trading.py auto_resolve` — hits MLB Stats API box scores, marks each PENDING bet WIN or LOSS, fires updated P&L to Discord
+- **Manual resolve**: `python alerts/paper_trading.py resolve` — interactive fallback
+- **Scheduled**: Windows Task Scheduler runs `resolve_trades.bat` at 11:30 PM ET nightly
+- Bankroll starts at $1,000 (set via `BANKROLL` in `.env`)
+- Trade columns: date, player, prop_type, side, line, odds, ev, stake, bankroll_before, bankroll_after, result, payout, net, matchup, book
+
 ### `alerts/discord_alerts.py` — WORKING
 - Sends formatted Discord embed with: player, prop, odds, EV%, model vs implied prob, Kelly stake, game time, tier badge
 - **PlaybookIQ score (0-100)**: composite of EV (40pts) + edge (30pts) + xFIP quality (20pts) + sample size (10pts)
@@ -197,8 +207,7 @@ Boyd) are all pitchers tracking UP vs history — a much stronger foundation.
 1. **Batter matchup context** — add opposing team K-rate (from team_krates.csv) into the prop signal
 2. **Claude AI analysis** — prompt Claude with the full signal context, get a plain-English write-up
 3. **Supabase logging** — store signals and track bet outcomes over time
-4. **Result tracking** — after each game, record whether the prop hit and update a P&L log
-5. **Batter props** — expand beyond pitchers to hit/HR/RBI props
+4. **Batter props** — expand beyond pitchers to hit/HR/RBI props
 
 ---
 

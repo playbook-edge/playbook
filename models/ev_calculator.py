@@ -554,6 +554,14 @@ def run():
     except Exception as e:
         print(f'  Alert error: {e}')
 
+    # --- Log paper trades ---
+    print(f'\n--- Logging Paper Trades ---')
+    try:
+        from alerts.paper_trading import log_bets_from_signals
+        log_bets_from_signals(signals, ev_threshold=EV_THRESHOLD, max_bets=5)
+    except Exception as e:
+        print(f'  Paper trading error: {e}')
+
 
 if __name__ == '__main__':
     run()
