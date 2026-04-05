@@ -15,6 +15,7 @@ pitcher quality (xFIP), and sample size (IP per start).
 
 import os
 import sys
+import json
 import requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -178,6 +179,14 @@ def _rule_based_summary(signal: dict) -> str:
             elif xfip_f > 4.5 and side == 'Under':
                 parts.append(f'Elevated xFIP of {xfip_f:.2f} suggests regression — under has extra value.')
 
+    velo_trend = signal.get('velo_trend')
+    if velo_trend is not None and not pd.isna(velo_trend) and prop_type != 'pitcher_innings':
+        vt = float(velo_trend)
+        if vt >= 0.8:
+            parts.append(f'Fastball velocity is up {vt:.1f} mph over the last week — gaining steam.')
+        elif vt <= -0.8:
+            parts.append(f'Fastball velocity is down {abs(vt):.1f} mph over the last week — a concern.')
+
     parts.append(
         f'Model probability is {float(signal.get("model_prob", 0)):.0%} vs '
         f'the book\'s {float(signal.get("implied_prob", 0)):.0%} — '
@@ -225,6 +234,20 @@ def generate_summary(signal: dict) -> str:
             facts.append(f'xFIP: {float(xfip):.2f}')
         if ip_per_start and not pd.isna(ip_per_start):
             facts.append(f'Avg IP/start: {float(ip_per_start):.1f}')
+        velo_trend = signal.get('velo_trend')
+        spin_rate  = signal.get('spin_rate')
+        pitch_mix  = signal.get('pitch_mix')
+        if velo_trend is not None and not pd.isna(velo_trend):
+            facts.append(f'Velocity trend (last 7d vs 30d avg): {float(velo_trend):+.1f} mph')
+        if spin_rate is not None and not pd.isna(spin_rate):
+            facts.append(f'Fastball spin rate: {float(spin_rate):.0f} RPM')
+        if pitch_mix is not None and not pd.isna(pitch_mix):
+            try:
+                mix = json.loads(str(pitch_mix))
+                top = sorted(mix.items(), key=lambda x: x[1], reverse=True)[:3]
+                facts.append('Pitch mix: ' + ' · '.join(f'{k} {v:.0%}' for k, v in top))
+            except Exception:
+                pass
         facts.append(f'Model probability: {model_prob:.0%} | Book implied: {implied_prob:.0%}')
         facts.append(f'Edge: {edge:+.0%} | EV: {ev:+.0%}')
 
@@ -341,11 +364,39 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
     embed.add_embed_field(name='IP/Start',      value=ip_str,      inline=True)
     embed.add_embed_field(name='Matchup',       value=matchup_str, inline=True)
 
-    embed.add_embed_field(name='Opp K-Rate', value=opp_k_str, inline=True)
-    embed.add_embed_field(name='Opp Team',   value=str(opp_team) if opp_team else 'N/A', inline=True)
-    embed.add_embed_field(name='\u200b',     value='\u200b',   inline=True)  # spacer
+    embed.add_embed_field(name='Opp K-Rate', value=opp_k_str,                               inline=True)
+    embed.add_embed_field(name='Opp Team',   value=str(opp_team) if opp_team else 'N/A',   inline=True)
 
-    # Row 5 — plain-English rationale
+    # Velocity trend
+    velo_trend_val = signal.get('velo_trend')
+    if velo_trend_val is not None and not pd.isna(velo_trend_val):
+        vt = float(velo_trend_val)
+        arrow = '↑' if vt > 0.3 else ('↓' if vt < -0.3 else '→')
+        velo_trend_str = f'{vt:+.1f} mph {arrow}'
+    else:
+        velo_trend_str = 'N/A'
+
+    # Fastball spin rate
+    spin_val = signal.get('spin_rate')
+    spin_str = f'{int(float(spin_val)):,} RPM' if spin_val is not None and not pd.isna(spin_val) else 'N/A'
+
+    # Pitch mix — top 3 pitch types
+    pitch_mix_val = signal.get('pitch_mix')
+    pitch_mix_str = 'N/A'
+    if pitch_mix_val is not None and not pd.isna(pitch_mix_val):
+        try:
+            mix = json.loads(str(pitch_mix_val))
+            top = sorted(mix.items(), key=lambda x: x[1], reverse=True)[:3]
+            pitch_mix_str = ' · '.join(f'{k} {v:.0%}' for k, v in top)
+        except Exception:
+            pass
+
+    embed.add_embed_field(name='Velo Trend',   value=velo_trend_str, inline=True)
+    embed.add_embed_field(name='FB Spin Rate', value=spin_str,        inline=True)
+    embed.add_embed_field(name='Pitch Mix',    value=pitch_mix_str,   inline=True)
+    embed.add_embed_field(name='\u200b',       value='\u200b',        inline=True)  # spacer
+
+    # Plain-English rationale
     summary = generate_summary(signal)
     embed.add_embed_field(name='Why we like it', value=summary, inline=False)
 

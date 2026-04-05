@@ -403,6 +403,38 @@ def build_ev_signals(props_df:    pd.DataFrame,
 
         prop_type = str(prop.get('prop_type', 'pitcher_strikeouts'))
 
+        # ── Savant context: velocity trend, spin rate, pitch mix, handedness ──
+        sv_lookup = match_name(player, savant_df['name'])
+        sv_row    = savant_df[savant_df['name'] == sv_lookup].iloc[0] if sv_lookup else None
+
+        throws     = 'R'
+        velo_trend = None
+        spin_rate  = None
+        pitch_mix  = None
+
+        if sv_row is not None:
+            t = sv_row.get('throws')
+            if t and pd.notna(t):
+                throws = str(t)
+            vt = sv_row.get('velo_trend')
+            if vt is not None and pd.notna(vt):
+                velo_trend = float(vt)
+            sr = sv_row.get('spin_rate')
+            if sr is not None and pd.notna(sr):
+                spin_rate = float(sr)
+            pm = sv_row.get('pitch_mix')
+            if pm is not None and pd.notna(pm):
+                pitch_mix = str(pm)
+
+        # ── Velocity trend adjustment ─────────────────────────────────────────
+        # Compares last 7 days of fastball velo vs the full 30-day avg.
+        # +1 mph over last week → ~1.5% boost to expected Ks (pitcher gaining steam).
+        # -1 mph → ~1.5% reduction (losing velo is a warning sign).
+        # Capped at ±6% so a single hot/cold week can't swing the model too far.
+        velo_factor = 1.0
+        if velo_trend is not None and prop_type != 'pitcher_innings':
+            velo_factor = 1.0 + max(min(velo_trend * 0.015, 0.06), -0.06)
+
         # ── Batter matchup context ────────────────────────────
         # Look up the opposing lineup's K-rate vs this pitcher's hand.
         # A strikeout-prone lineup boosts expected Ks; a contact lineup lowers them.
@@ -412,15 +444,6 @@ def build_ev_signals(props_df:    pd.DataFrame,
         matchup_factor = 1.0
 
         if krates_df is not None and prop_type != 'pitcher_innings':
-            # Pitcher handedness from savant_df (defaults to R if not found)
-            sv_lookup = match_name(player, savant_df['name'])
-            throws = 'R'
-            if sv_lookup:
-                sv_row = savant_df[savant_df['name'] == sv_lookup].iloc[0]
-                t = sv_row.get('throws')
-                if t and pd.notna(t):
-                    throws = str(t)
-
             # Pitcher's team code from stats_df
             pitcher_team = ''
             if stats_name:
@@ -430,8 +453,8 @@ def build_ev_signals(props_df:    pd.DataFrame,
                 pitcher_team, str(prop.get('matchup', '')), throws, krates_df
             )
 
-        # Apply matchup factor: scale K/9 up/down based on opposing lineup
-        adjusted_k9 = blended_k9 * matchup_factor
+        # Apply matchup and velocity trend factors to blended K/9
+        adjusted_k9 = blended_k9 * matchup_factor * velo_factor
 
         # ── Route to the correct probability model ────────────
         if prop_type == 'pitcher_innings':
@@ -473,6 +496,10 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'hist_reliability': hist_reliability,
             'ip_per_start':     round(ip_per_start, 1),
             'xfip':             xfip_val,
+            'velo_trend':       round(velo_trend, 1) if velo_trend is not None else None,
+            'velo_factor':      round(velo_factor, 3),
+            'spin_rate':        round(spin_rate, 0) if spin_rate is not None else None,
+            'pitch_mix':        pitch_mix,
             'opp_team':         opp_team,
             'opp_k_pct':        opp_k_pct,
             'matchup_factor':   matchup_factor,
