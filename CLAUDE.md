@@ -140,17 +140,21 @@ After all 6 steps, `send_pipeline_summary()` fires to the health channel.
 - Trade columns: date, player, prop_type, side, line, odds, ev, stake, bankroll_before, bankroll_after, result, payout, net, matchup, book
 
 ### `alerts/discord_alerts.py` — WORKING
-- Sends formatted Discord embed with: player, prop, odds, EV%, model vs implied prob, Kelly stake, game time, tier badge
+- **Daily card** (`send_daily_card`): the main alert function — sends all flagged bets as one Discord message (one embed per bet, stacked). Called from ev_calculator.py after each run.
+  - Shows: tier badge (🟢🟡🔴🎰), bet title, book/odds/game time, PlaybookIQ bar (▓░ blocks), velo trend emoji + label, K-rate rank sentence, Claude AI narrative
+  - Hides: model prob, edge %, EV %, Kelly stake
+  - K-rate rank: loads team_krates.csv, ranks opponent among all 30 teams for the pitcher's handedness
+  - Claude narrative: 2-3 sentences, casual tone, written for a casual bettor — uses pitcher name, K/9, xFIP, velo trend, opponent context
+  - `dry_run=True` prints terminal preview without sending
+- **Tier badges by EV**: Conservative 4-7% (🟢), Moderate 7-12% (🟡), Aggressive 12-20% (🔴), Degen 20%+ (🎰)
 - **PlaybookIQ score (0-100)**: composite of EV (40pts) + edge (30pts) + xFIP quality (20pts) + sample size (10pts)
-- **Tier badges by EV**: Conservative 4-7% (green), Moderate 7-12% (yellow), Aggressive 12-20% (red), Degen 20%+ (purple)
-- Embed shows: spin rate, velocity trend, pitch mix, opp K-rate, xFIP, IP/start, matchup
 - Game time looked up live from MLB Stats API
 - Bet alerts → `DISCORD_WEBHOOK_CONSERVATIVE`
+- `send_alert()` and `fire_alerts_from_signals()` still exist but are no longer called by the pipeline (kept for manual use)
 - **Health functions** (go to `DISCORD_WEBHOOK_HEALTH` only — never to bet channels):
   - `send_pipeline_summary(results, runtime_seconds, signal_count)` — full run summary after step 6
   - `send_error_alert(step_name, error_message)` — immediate alert on any step failure
   - `send_heartbeat(game_count, pending_trades)` — daily alive-check (call manually or from resolve script)
-- `fire_alerts_from_signals()` caps at 5 alerts per run to avoid spam
 
 ---
 
@@ -247,10 +251,9 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 
 ## What to Build Next (rough order)
 
-1. **Claude AI analysis** — set `ANTHROPIC_API_KEY` in Railway + `.env` to enable plain-English rationale on bet alerts
-2. **Wire `send_heartbeat`** — call from the resolve script so health channel gets a daily ping after results are processed
-3. **Batter props** — expand beyond pitchers to hit/HR/RBI props
-4. **Result accuracy tracking** — measure model calibration as the season progresses
+1. **Wire `send_heartbeat`** — call from the resolve script so health channel gets a daily ping after results are processed
+2. **Batter props** — expand beyond pitchers to hit/HR/RBI props
+3. **Result accuracy tracking** — measure model calibration as the season progresses
 
 ---
 
