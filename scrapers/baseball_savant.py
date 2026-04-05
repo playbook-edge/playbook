@@ -26,7 +26,7 @@ from pybaseball import cache
 cache.enable()
 
 OUTPUT_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw', 'savant_today.csv')
-DELAY = 5   # seconds between Statcast requests
+DELAY = 2   # seconds between Statcast requests
 FASTBALL_TYPES = {'FF', 'FT', 'SI', 'FC', 'FS'}  # pitch types treated as fastballs
 
 END_DATE   = datetime.now()

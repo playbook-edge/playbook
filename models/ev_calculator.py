@@ -350,9 +350,11 @@ def build_ev_signals(props_df:    pd.DataFrame,
         stats_name = match_name(player, stats_df['name'])
         if stats_name:
             st = stats_df[stats_df['name'] == stats_name].iloc[0]
-            k9         = float(st['k9'])
-            ip_per_start = float(st['ip']) / max(float(st['starts']), 1)
+            k9           = float(st['k9'])
+            curr_starts  = float(st.get('starts', 0))
+            ip_per_start = float(st['ip']) / max(curr_starts, 1)
         else:
+            curr_starts = 0.0
             # Fall back to Statcast K% * ~24 estimated batters faced
             sv_name = match_name(player, savant_df['name'])
             if sv_name:
@@ -387,8 +389,15 @@ def build_ev_signals(props_df:    pd.DataFrame,
                 hist_reliability = int(bl.get('reliability', 50))
                 k9_trend         = bl.get('k9_trend', 'NEW')
 
-                # Weight blend by reliability: high reliability = trust history more
-                hist_weight = 0.30 + (hist_reliability / 100) * 0.20   # 30-50%
+                # Base weight from reliability (30–50% historical)
+                base_hist = 0.30 + (hist_reliability / 100) * 0.20
+
+                # Early-season bonus: fewer starts = lean much harder on history.
+                # 1 start → +40% to hist weight, 10+ starts → no bonus.
+                # Prevents 1-2 start K/9 noise from creating fake DEGEN signals.
+                early_bonus = max(0.0, (1.0 - curr_starts / 10.0)) * 0.40
+
+                hist_weight = min(base_hist + early_bonus, 0.85)
                 curr_weight = 1 - hist_weight
                 blended_k9  = curr_weight * k9 + hist_weight * hist_k9
 

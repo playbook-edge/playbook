@@ -16,8 +16,10 @@ Used by ev_calculator.py to weight PlaybookIQ with historical context.
 
 import os
 import sys
+import math
 import numpy as np
 import pandas as pd
+from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -211,10 +213,51 @@ def lookup_baseline(pitcher_name: str, baselines_df: pd.DataFrame) -> dict | Non
     return None
 
 
+def _clean_for_db(val):
+    """Convert a value to JSON-safe Python native type for Supabase."""
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+        return None
+    if isinstance(val, np.integer):
+        return int(val)
+    if isinstance(val, np.floating):
+        return float(val)
+    return val
+
+
 def run():
     print('=' * 55)
     print('  PLAYBOOK -- Player Baseline Builder')
     print('=' * 55)
+
+    # Check Supabase cache first — baselines are rebuilt from 2024/2025 data
+    # which doesn't change mid-season. Skip the expensive rebuild if cache is
+    # less than 7 days old.
+    try:
+        from database import get_client
+        client = get_client()
+        if client:
+            resp = client.table('player_baselines_cache').select('*').limit(1).execute()
+            if resp.data:
+                updated_str = resp.data[0].get('updated_at', '')
+                updated_at  = datetime.fromisoformat(updated_str.replace('Z', '+00:00'))
+                age         = datetime.now(timezone.utc) - updated_at
+                if age < timedelta(days=7):
+                    print(f'  Baselines cached in Supabase ({age.days}d old) — loading from DB.')
+                    full = client.table('player_baselines_cache').select('*').execute()
+                    df   = pd.DataFrame(full.data).drop(columns=['id', 'updated_at'], errors='ignore')
+                    os.makedirs(HIST_DIR, exist_ok=True)
+                    df.to_csv(OUT_PATH, index=False)
+                    print(f'  Loaded {len(df)} baselines. Skipping rebuild.')
+                    return
+    except Exception as e:
+        print(f'  Supabase cache check failed ({e}) — rebuilding.')
 
     all_path = os.path.join(HIST_DIR, 'pitcher_stats_all.csv')
     if not os.path.exists(all_path):
@@ -234,8 +277,24 @@ def run():
     print('Building baselines...')
     baselines = build_baselines(hist_df, current_df)
     baselines.to_csv(OUT_PATH, index=False)
-
     print(f'Saved {len(baselines)} player baselines to: {os.path.normpath(OUT_PATH)}')
+
+    # Cache to Supabase so Railway skips this rebuild for the next 7 days
+    try:
+        from database import get_client
+        client = get_client()
+        if client:
+            client.table('player_baselines_cache').delete().neq('id', 0).execute()
+            records = [
+                {k: _clean_for_db(v) for k, v in row.items()}
+                for row in baselines.to_dict('records')
+            ]
+            batch = 100
+            for i in range(0, len(records), batch):
+                client.table('player_baselines_cache').insert(records[i:i+batch]).execute()
+            print(f'  Player baselines cached to Supabase ({len(records)} pitchers).')
+    except Exception as e:
+        print(f'  Supabase cache write failed ({e}) — continuing.')
 
     # ── Summary stats ──
     has_history  = baselines[baselines['seasons_in_data'] >= 2]

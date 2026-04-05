@@ -12,9 +12,12 @@ No API keys required.
 """
 
 import os
+import sys
 import time
 import pandas as pd
 from datetime import datetime
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from pybaseball import statcast, pitching_stats
 from pybaseball import cache
@@ -50,6 +53,21 @@ def add_batting_team(df):
 # ---------------------------------------------------------------------------
 
 def build_team_krates():
+    # Check Supabase cache first — the full-season Statcast pull is the slowest
+    # step in the pipeline. If we already ran it today, reuse the cached result.
+    try:
+        from database import get_client
+        client = get_client()
+        if client:
+            resp = client.table('team_krates_cache').select('*').eq('fetch_date', TODAY).execute()
+            if resp.data:
+                print(f'  Using cached team K-rates from Supabase ({len(resp.data)} teams).')
+                df = pd.DataFrame(resp.data).drop(columns=['id', 'fetch_date'], errors='ignore')
+                df = df.rename(columns={'vs_rhp': 'vs_RHP', 'vs_lhp': 'vs_LHP'})
+                return df.sort_values('vs_RHP', ascending=False).reset_index(drop=True)
+    except Exception as e:
+        print(f'  Supabase cache check failed ({e}) — fetching fresh.')
+
     print(f"Fetching Statcast data ({SEASON_START} to {TODAY}) for team K-rate splits...")
     print("  (This may take 15-30 seconds)")
     time.sleep(DELAY)
@@ -95,6 +113,28 @@ def build_team_krates():
     wide = wide.merge(pa_rhp, on='team', how='left')
     wide = wide.merge(pa_lhp, on='team', how='left')
     wide = wide.sort_values('vs_RHP', ascending=False).reset_index(drop=True)
+
+    # Save to Supabase so Railway skips this slow fetch on future runs today
+    try:
+        from database import get_client
+        client = get_client()
+        if client:
+            client.table('team_krates_cache').delete().neq('id', 0).execute()
+            records = [
+                {
+                    'fetch_date': TODAY,
+                    'team':       str(r['team']),
+                    'vs_rhp':     float(r['vs_RHP']) if pd.notna(r.get('vs_RHP')) else None,
+                    'vs_lhp':     float(r['vs_LHP']) if pd.notna(r.get('vs_LHP')) else None,
+                    'pa_vs_rhp':  int(r['pa_vs_rhp']) if pd.notna(r.get('pa_vs_rhp')) else None,
+                    'pa_vs_lhp':  int(r['pa_vs_lhp']) if pd.notna(r.get('pa_vs_lhp')) else None,
+                }
+                for _, r in wide.iterrows()
+            ]
+            client.table('team_krates_cache').insert(records).execute()
+            print(f'  Team K-rates cached to Supabase ({len(records)} teams).')
+    except Exception as e:
+        print(f'  Supabase cache write failed ({e}) — continuing.')
 
     return wide
 
