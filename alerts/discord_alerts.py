@@ -248,6 +248,12 @@ def generate_summary(signal: dict) -> str:
                 facts.append('Pitch mix: ' + ' · '.join(f'{k} {v:.0%}' for k, v in top))
             except Exception:
                 pass
+        prob_capped   = signal.get('prob_capped')
+        low_line_note = signal.get('low_line_note')
+        if prob_capped:
+            facts.append('Note: model probability was capped at 75% ceiling')
+        if low_line_note and not pd.isna(low_line_note):
+            facts.append(f'Note: {low_line_note}')
         facts.append(f'Model probability: {model_prob:.0%} | Book implied: {implied_prob:.0%}')
         facts.append(f'Edge: {edge:+.0%} | EV: {ev:+.0%}')
 
