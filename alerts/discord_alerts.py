@@ -819,16 +819,17 @@ def send_daily_card(signals_df: pd.DataFrame,
         narrative = _daily_card_narrative(signal, krate_sentence)
 
         # Discord embed description
-        desc = '\n'.join(filter(None, [
+        desc_lines = [
             f'**{bet_title}**',
             subline,
             '',
             f'PlaybookIQ: **{iq_score}/100**  {iq_bar_discord}',
             f'{trend_emoji}  {trend_label}',
-            krate_sentence,
-            '',
-            narrative,
-        ]))
+        ]
+        if krate_sentence:
+            desc_lines.append(krate_sentence)
+        desc_lines += ['', narrative]
+        desc = '\n'.join(desc_lines)
 
         embed = DiscordEmbed(
             title=f'{tier_emoji}  {tier_label}',
