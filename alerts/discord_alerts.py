@@ -128,6 +128,97 @@ def get_game_time(matchup: str) -> str:
 
 
 # ─────────────────────────────────────────────
+# Bet rationale summary
+# ─────────────────────────────────────────────
+
+def generate_summary(signal: dict) -> str:
+    """
+    Write a 1-2 sentence plain-English reason for the bet.
+    Built from the signal data — no API call needed.
+    """
+    player     = signal.get('player', 'This pitcher')
+    side       = str(signal.get('side', ''))
+    line       = signal.get('line')
+    prop_type  = str(signal.get('prop_type', 'pitcher_strikeouts'))
+    ev         = float(signal.get('ev', 0))
+    edge       = float(signal.get('model_prob', 0)) - float(signal.get('implied_prob', 0))
+    k9_curr    = signal.get('k9_current')
+    k9_hist    = signal.get('k9_historical')
+    k9_trend   = str(signal.get('k9_trend', 'NEW'))
+    xfip       = signal.get('xfip')
+    ip_per_start = signal.get('ip_per_start')
+
+    parts = []
+
+    if prop_type == 'pitcher_innings':
+        avg_ip_str = f'{float(ip_per_start):.1f}' if ip_per_start and not pd.isna(ip_per_start) else None
+
+        if side == 'Over':
+            if avg_ip_str:
+                parts.append(
+                    f'{player} has averaged {avg_ip_str} innings per start, '
+                    f'making {line:.1f}+ IP a realistic expectation.'
+                )
+            else:
+                parts.append(f'Model favours {player} going deep into this game.')
+        else:
+            if avg_ip_str and float(ip_per_start) < float(line):
+                parts.append(
+                    f'{player} has averaged only {avg_ip_str} IP per start — '
+                    f'clearing {line:.1f} innings would be above their norm.'
+                )
+            else:
+                parts.append(
+                    f'Early hook risk or tough matchup makes the under {line:.1f} IP attractive here.'
+                )
+
+    else:
+        # Strikeout prop
+        if k9_curr and k9_hist and not pd.isna(k9_hist):
+            k9_c = float(k9_curr)
+            k9_h = float(k9_hist)
+            delta = k9_c - k9_h
+
+            if k9_trend == 'UP':
+                parts.append(
+                    f'{player} is striking out batters at {k9_c:.1f} K/9 this season, '
+                    f'up from a {k9_h:.1f} historical average — stuff is trending sharper.'
+                )
+            elif k9_trend == 'DOWN':
+                parts.append(
+                    f'{player} is running at {k9_c:.1f} K/9, below their {k9_h:.1f} career norm — '
+                    f'the {side.lower()} aligns with that regression.'
+                )
+            else:
+                parts.append(
+                    f'{player} is on pace for {k9_c:.1f} K/9, consistent with their '
+                    f'{k9_h:.1f} historical average — a reliable profile.'
+                )
+        elif k9_curr and not pd.isna(k9_curr):
+            parts.append(
+                f'{player} is posting {float(k9_curr):.1f} K/9 this season.'
+            )
+
+        if xfip and not pd.isna(xfip):
+            xfip_f = float(xfip)
+            if xfip_f < 3.0:
+                parts.append(f'Elite xFIP of {xfip_f:.2f} confirms the underlying dominance.')
+            elif xfip_f < 3.8:
+                parts.append(f'Solid xFIP of {xfip_f:.2f} backs up the strikeout rate.')
+            elif xfip_f > 4.5 and side == 'Under':
+                parts.append(f'Elevated xFIP of {xfip_f:.2f} suggests regression — under has extra value.')
+
+    # Always close with the edge
+    parts.append(
+        f'Model probability is {float(signal.get("model_prob",0)):.0%} vs '
+        f'the book\'s {float(signal.get("implied_prob",0)):.0%} — '
+        f'a {edge:+.0%} edge at {ev:+.0%} EV.'
+    )
+
+    return ' '.join(parts)
+
+
+# ─────────────────────────────────────────────
 # Core send function
 # ─────────────────────────────────────────────
 
@@ -202,33 +293,17 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
     embed.add_embed_field(name='Book',          value=book_str,                                 inline=True)
     embed.add_embed_field(name='Game Time',     value=game_time,                                inline=True)
 
-    # Row 4 — pitcher context + historical
+    # Row 4 — context fields
     xfip_str = f'{float(xfip):.2f}' if xfip is not None and not pd.isna(xfip) else 'N/A'
     ip_str   = f'{float(ip_per_start):.1f}' if ip_per_start is not None and not pd.isna(ip_per_start) else 'N/A'
 
-    # Historical K/9 trend
-    k9_curr = signal.get('k9_current')
-    k9_hist = signal.get('k9_historical')
-    k9_trend = signal.get('k9_trend', 'NEW')
-    trend_arrow = {'UP': 'UP', 'DOWN': 'DOWN', 'STABLE': 'STABLE', 'NEW': 'NEW'}.get(str(k9_trend), 'NEW')
-    reliability = signal.get('hist_reliability')
+    embed.add_embed_field(name='xFIP (season)', value=xfip_str,    inline=True)
+    embed.add_embed_field(name='IP/Start',      value=ip_str,      inline=True)
+    embed.add_embed_field(name='Matchup',       value=matchup_str, inline=True)
 
-    if k9_curr is not None and k9_hist is not None and not pd.isna(k9_hist):
-        hist_str = f'{float(k9_hist):.1f} K/9 hist  |  {float(k9_curr):.1f} now  [{trend_arrow}]'
-    elif k9_curr is not None:
-        hist_str = f'{float(k9_curr):.1f} K/9 (no history)'
-    else:
-        hist_str = 'N/A'
-
-    reliability_str = f'{int(reliability)}/100' if reliability is not None and not pd.isna(reliability) else 'N/A'
-
-    embed.add_embed_field(name='xFIP (season)',   value=xfip_str,       inline=True)
-    embed.add_embed_field(name='IP/Start',        value=ip_str,         inline=True)
-    embed.add_embed_field(name='Matchup',         value=matchup_str,    inline=True)
-
-    embed.add_embed_field(name='K/9 vs History',  value=hist_str,       inline=False)
-    embed.add_embed_field(name='Data Reliability',value=reliability_str, inline=True)
-    embed.add_embed_field(name='Blended K/9',     value=f'{float(signal.get("k9_used", 0)):.1f}', inline=True)
+    # Row 5 — plain-English rationale
+    summary = generate_summary(signal)
+    embed.add_embed_field(name='Why we like it', value=summary, inline=False)
 
     embed.set_footer(text=f'Playbook Edge  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
     embed.set_timestamp()
