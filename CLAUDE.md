@@ -41,7 +41,7 @@ playbook/
 ├── research/             # Notes, experiments, one-off analysis
 ├── config.py             # All settings loaded from .env
 ├── main.py               # Full pipeline — runs all 6 steps in order
-├── run_playbook.bat      # Double-click or schedule via Task Scheduler
+├── run_playbook.bat      # Double-click to run manually
 ├── requirements.txt      # All dependencies
 ├── .env.example          # Template — copy to .env and fill in keys
 └── .gitignore            # Keeps .env and data files off GitHub
@@ -52,7 +52,7 @@ playbook/
 ## Full Pipeline (main.py — 6 steps)
 
 Run manually: `python main.py`
-Scheduled via: Windows Task Scheduler pointing at `run_playbook.bat` (set to 10:30am daily)
+Scheduled via: **Railway** cron at 10:30 AM ET (`30 14 * * *`) — no Windows Task Scheduler needed.
 
 ```
 Step 1  scrapers/baseball_savant.py   →  data/raw/savant_today.csv
@@ -68,7 +68,8 @@ Step 6  models/ev_calculator.py       →  data/processed/ev_signals.csv
 ```
 
 Each step is isolated — one failure doesn't stop the rest.
-A pipeline summary embed is also sent to Discord after all steps complete.
+On failure, `send_error_alert()` fires immediately to the health channel.
+After all 6 steps, `send_pipeline_summary()` fires to the health channel.
 
 ---
 
@@ -78,9 +79,10 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 - Fetches today's probable starters from the free MLB Stats API (no key needed)
 - For each pitcher: calls `pybaseball.statcast_pitcher()` for last-30-day pitch data
 - Computes K%, fastball velocity, BABIP from raw Statcast rows
+- Also computes: **spin rate** (fastball RPM), **velocity trend** (last 7d vs 30d avg mph diff), **pitch mix** (% per pitch type as JSON)
 - Tries FanGraphs xFIP via `pitching_stats_range()` — fails early in season (empty table), xFIP shows None until ~mid-April
-- 2-second delay between requests (reduced from 5s for Railway speed); pybaseball cache enabled
-- Captures pitcher throwing hand (R/L) from MLB Stats API, saved to savant_today.csv as `throws` column
+- 2-second delay between requests; pybaseball cache enabled
+- Captures pitcher throwing hand (R/L) from MLB Stats API, saved as `throws` column
 - **Known quirk**: accented names (e.g. Vásquez) print garbled in Windows terminal — data in CSV is correct
 
 ### `scrapers/fangraphs.py` — WORKING
@@ -114,13 +116,18 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 ### `models/ev_calculator.py` — WORKING
 - **Pure math layer**: American odds conversion, EV formula, Kelly Criterion (half-Kelly, capped 5%)
 - **Poisson model**: converts K/9 + expected IP into probability of going over/under any line
-- **Historical blending**: blends current K/9 with historical baseline
-  - High-reliability pitchers (90+): ~50% historical, ~50% current
-  - Low-reliability/new pitchers: ~70% current, ~30% historical
-  - **Starts-aware early-season adjustment**: 1 start = 85% historical, ramps to normal by 10 starts — prevents early-April noise from inflating EV
-- **Batter matchup context**: scales expected Ks by opposing lineup K-rate vs pitcher handedness (▲/▼ shown in Discord)
+- **Historical blending** (starts-aware hard floors):
+  - 0–3 starts: 92% historical, 8% current
+  - 4–6 starts: 80% historical, 20% current
+  - 7–9 starts: ramp from reliability-based + early bonus toward normal
+  - 10+ starts: normal reliability-based weight (30–50% historical)
+- **Velocity trend adjustment**: ±1.5% per mph (last 7d vs 30d avg), capped at ±6%
+- **Batter matchup context**: scales expected Ks by opposing lineup K-rate vs pitcher handedness
+- **Probability ceiling**: model probability capped at 75% before EV calculation; `prob_capped` column tracks when this fires
+- **Low line discount**: lines ≤3.5 → model prob × 0.88; lines ≤2.5 → × 0.80; `low_line_note` column explains when applied
 - **Synthetic props fallback**: when no live props exist, generates lines from K/9 for testing
 - Flags any prop above 4% EV; saves full results to `ev_signals.csv`
+- ev_signals.csv new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `prob_capped`, `low_line_note`
 
 ### `alerts/paper_trading.py` — WORKING
 - Logs every flagged bet to `data/processed/paper_trades.csv` (called automatically by ev_calculator)
@@ -128,7 +135,7 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 - Sends running P&L summary embed after all bets are placed
 - **Auto-resolve**: `python alerts/paper_trading.py auto_resolve` — hits MLB Stats API box scores, marks each PENDING bet WIN or LOSS, fires updated P&L to Discord
 - **Manual resolve**: `python alerts/paper_trading.py resolve` — interactive fallback
-- **Scheduled**: Windows Task Scheduler runs `resolve_trades.bat` at 11:30 PM ET nightly
+- **Scheduled**: Railway cron service `playbook-resolve` runs at 11:30 PM ET (`30 3 * * *`)
 - Bankroll starts at $1,000 (set via `BANKROLL` in `.env`)
 - Trade columns: date, player, prop_type, side, line, odds, ev, stake, bankroll_before, bankroll_after, result, payout, net, matchup, book
 
@@ -136,9 +143,13 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 - Sends formatted Discord embed with: player, prop, odds, EV%, model vs implied prob, Kelly stake, game time, tier badge
 - **PlaybookIQ score (0-100)**: composite of EV (40pts) + edge (30pts) + xFIP quality (20pts) + sample size (10pts)
 - **Tier badges by EV**: Conservative 4-7% (green), Moderate 7-12% (yellow), Aggressive 12-20% (red), Degen 20%+ (purple)
-- Embed now shows: K/9 vs History field with trend arrow, Data Reliability score, Blended K/9 used
+- Embed shows: spin rate, velocity trend, pitch mix, opp K-rate, xFIP, IP/start, matchup
 - Game time looked up live from MLB Stats API
-- Webhook URL: `DISCORD_WEBHOOK_CONSERVATIVE` in `.env`
+- Bet alerts → `DISCORD_WEBHOOK_CONSERVATIVE`
+- **Health functions** (go to `DISCORD_WEBHOOK_HEALTH` only — never to bet channels):
+  - `send_pipeline_summary(results, runtime_seconds, signal_count)` — full run summary after step 6
+  - `send_error_alert(step_name, error_message)` — immediate alert on any step failure
+  - `send_heartbeat(game_count, pending_trades)` — daily alive-check (call manually or from resolve script)
 - `fire_alerts_from_signals()` caps at 5 alerts per run to avoid spam
 
 ---
@@ -147,14 +158,14 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 
 | File | Updated | Contents |
 |------|---------|----------|
-| `data/raw/savant_today.csv` | Daily | Today's starters: k_pct, velo, babip |
+| `data/raw/savant_today.csv` | Daily | Today's starters: k_pct, velo, velo_trend, spin_rate, pitch_mix, babip |
 | `data/raw/pitcher_stats.csv` | Daily | Season leaderboard: k9, xfip, fip, babip |
 | `data/raw/team_krates.csv` | Daily | Team K% vs RHP and LHP |
 | `data/raw/todays_props.csv` | Daily | Live prop lines from books |
 | `data/historical/pitcher_stats_2024.csv` | Once/year | Full 2024 FanGraphs season |
 | `data/historical/pitcher_stats_2025.csv` | Once/year | Full 2025 FanGraphs season |
 | `data/historical/player_baselines.csv` | Daily | 935 pitcher baselines with trends |
-| `data/processed/ev_signals.csv` | Daily | All EV calculations + flags |
+| `data/processed/ev_signals.csv` | Daily | All EV calculations + flags + calibration notes |
 
 ---
 
@@ -164,8 +175,11 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 |-----|---------|--------|
 | `ODDS_API_KEY` | odds_api.py | Set |
 | `DISCORD_WEBHOOK_CONSERVATIVE` | discord_alerts.py | Set |
-| `ANTHROPIC_API_KEY` | (future) Claude analysis | Not set |
-| `SUPABASE_URL` + `SUPABASE_KEY` | (future) database | Not set |
+| `DISCORD_WEBHOOK_PAPER` | paper_trading.py | Set |
+| `DISCORD_WEBHOOK_HEALTH` | discord_alerts.py health functions | Set |
+| `SUPABASE_URL` + `SUPABASE_KEY` | database.py | Set |
+| `BANKROLL` | ev_calculator.py | Set ($1000) |
+| `ANTHROPIC_API_KEY` | discord_alerts.py Claude rationale | Not set — falls back to rule-based |
 
 ---
 
@@ -174,10 +188,9 @@ A pipeline summary embed is also sent to Discord after all steps complete.
 | Package | Purpose |
 |---------|---------|
 | `pybaseball` | Statcast + FanGraphs data |
-| `anthropic` | Claude AI for analysis (not wired in yet) |
+| `anthropic` | Claude AI for plain-English rationale (falls back if key not set) |
 | `requests` | HTTP calls to MLB Stats API and Odds API |
-| `supabase` | Database (not connected yet) |
-| `apscheduler` | Scheduling (replaced by Task Scheduler — not used) |
+| `supabase` | Database writes |
 | `python-dotenv` | Loads `.env` |
 | `discord-webhook` | Sends alerts to Discord |
 | `pandas` | Data wrangling |
@@ -195,25 +208,32 @@ model for "how many times does X happen in Y opportunities."
 2 years of 9.0 K/9 who has 11.0 in 2 starts is probably not suddenly elite —
 blending pulls the estimate back toward what we actually know about them.
 
+**Why hard floors on early-season blending?** The old smooth ramp still let 1-3 start
+samples move the model too much. Hard floors (92% hist for <4 starts, 80% for 4-6)
+prevent April noise from generating fake DEGEN signals on live data.
+
+**Why a probability ceiling?** Poisson can output 90%+ confidence on easy lines but
+real-world variance (early hook, rain, quick inning) makes near-certainty unreliable.
+Capped at 75% to keep Kelly stakes sane.
+
+**Why low line discounts?** Lines of 3.5 and under are highly sensitive to game script.
+One early exit or quick inning tanks the result. The model probability is discounted
+to reflect that uncertainty: ×0.88 for lines ≤3.5, ×0.80 for lines ≤2.5.
+
 **EV formula**: `(model_prob × payout) - (1 - model_prob)`
 Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-40%
 (synthetic data has inflated edges because lines are set at expected value).
-
-**What the system caught with history**: Kyle Leahy and Zac Gallen were the top
-synthetic signals (47%, 39% EV) but both are DOWN 5+ K/9 vs their historical average.
-Historical blending correctly downweighted them. The new top signals (Hancock, Irvin,
-Boyd) are all pitchers tracking UP vs history — a much stronger foundation.
 
 ---
 
 ## Deployment
 
-- **Railway**: pipeline runs daily at 10:30 AM ET via cron (`30 14 * * *`)
+- **Railway — main pipeline**: `python main.py`, cron `30 14 * * *` (10:30 AM ET)
   - Repo: `playbook-edge/playbook`, branch: master
-  - Env vars set in Railway dashboard (same as .env)
-  - `railway.json` configures Nixpacks build + `python main.py` start command
-- **Windows Task Scheduler**: `resolve_trades.bat` runs `auto_resolve` at 11:30 PM ET nightly
-  - Keep this running — Railway handles the pipeline, Windows handles the resolve
+  - Env vars set in Railway dashboard
+  - `railway.json` sets builder only — start command set per-service in Railway UI
+- **Railway — resolve service** (`playbook-resolve`): `python alerts/paper_trading.py auto_resolve`, cron `30 3 * * *` (11:30 PM ET)
+- Ephemeral disk — all persistence goes through Supabase
 
 ## Supabase Tables
 
@@ -227,9 +247,10 @@ Boyd) are all pitchers tracking UP vs history — a much stronger foundation.
 
 ## What to Build Next (rough order)
 
-1. **Claude AI analysis** — wire in ANTHROPIC_API_KEY for plain-English bet rationale (key not set yet)
-2. **Batter props** — expand beyond pitchers to hit/HR/RBI props
-3. **Result accuracy tracking** — measure model calibration as the season progresses
+1. **Claude AI analysis** — set `ANTHROPIC_API_KEY` in Railway + `.env` to enable plain-English rationale on bet alerts
+2. **Wire `send_heartbeat`** — call from the resolve script so health channel gets a daily ping after results are processed
+3. **Batter props** — expand beyond pitchers to hit/HR/RBI props
+4. **Result accuracy tracking** — measure model calibration as the season progresses
 
 ---
 
@@ -238,7 +259,7 @@ Boyd) are all pitchers tracking UP vs history — a much stronger foundation.
 - No coding experience on the owner's side — always explain what you built and why in plain English after writing code
 - Test every script immediately after writing it and fix errors before handing back
 - Never commit `.env` — it contains real API keys
-- Keep scrapers gentle on rate limits (5-second delays minimum)
+- Keep scrapers gentle on rate limits (2-second delays minimum)
 - Save all raw data to `data/raw/` before any processing
 - Prefer simple, readable code over clever one-liners
 - After every session, update this file and push to GitHub
