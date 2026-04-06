@@ -276,8 +276,8 @@ All tables confirmed live and accepting writes as of 2026-04-05.
 1. **Real-money readiness dashboard** ✓ BUILT
    `alerts/readiness_dashboard.py` — weekly Discord embed to health channel. Shows verdict (GO/MONITOR/NOT YET/HOLD), avg CLV by tier, win rate vs break-even, ROI, bankroll. Railway service `playbook-readiness`, cron `0 13 * * 0` (9am ET Sundays). Run manually: `python alerts/readiness_dashboard.py` or `... preview` for terminal-only.
 
-2. **Wire `send_heartbeat`**
-   Call at the end of `auto_resolve` so the health channel confirms resolve ran, how many bets settled, and current bankroll. Right now there's no confirmation when nightly resolve completes successfully.
+2. **Wire `send_heartbeat`** ✓ ALREADY DONE
+   Called at the end of `auto_resolve` in both paths (bets resolved + no pending bets). Sends W/L record, pending count, game count to health channel. Lives in `discord_alerts.py:send_heartbeat()`.
 
 3. **Pitcher hand-off / innings cap detection**
    If a pitcher's season IP is suspiciously low for their start count, flag as potential innings cap and discount expected IP further. Protects against overvaluing K props on limited young arms (Skenes, post-injury returns).
