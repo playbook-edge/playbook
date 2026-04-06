@@ -253,6 +253,7 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
   - Env vars set in Railway dashboard
   - `railway.json` sets builder only — start command set per-service in Railway UI
 - **Railway — resolve service** (`playbook-resolve`): `python alerts/paper_trading.py auto_resolve`, cron `30 3 * * *` (11:30 PM ET)
+- **Railway — readiness dashboard** (`playbook-readiness`): `python alerts/readiness_dashboard.py`, cron `0 13 * * 0` (9am ET Sundays)
 - Ephemeral disk — all persistence goes through Supabase
 
 ## Supabase Tables
@@ -270,11 +271,22 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 
 All tables confirmed live and accepting writes as of 2026-04-05.
 
-## What to Build Next (rough order)
+## Roadmap
 
-1. **Wire `send_heartbeat`** — call from the resolve script so health channel gets a daily ping after results are processed
-2. **Batter props** — expand beyond pitchers to hit/HR/RBI props
-3. **Result accuracy tracking** — measure model calibration as the season progresses
+1. **Real-money readiness dashboard** ✓ BUILT
+   `alerts/readiness_dashboard.py` — weekly Discord embed to health channel. Shows verdict (GO/MONITOR/NOT YET/HOLD), avg CLV by tier, win rate vs break-even, ROI, bankroll. Railway service `playbook-readiness`, cron `0 13 * * 0` (9am ET Sundays). Run manually: `python alerts/readiness_dashboard.py` or `... preview` for terminal-only.
+
+2. **Wire `send_heartbeat`**
+   Call at the end of `auto_resolve` so the health channel confirms resolve ran, how many bets settled, and current bankroll. Right now there's no confirmation when nightly resolve completes successfully.
+
+3. **Pitcher hand-off / innings cap detection**
+   If a pitcher's season IP is suspiciously low for their start count, flag as potential innings cap and discount expected IP further. Protects against overvaluing K props on limited young arms (Skenes, post-injury returns).
+
+4. **Line movement tracking**
+   Log a "line at game time" snapshot in addition to opening (10:30am) and closing (resolve). Heavy movement against our position between open and game time is a signal the market knows something we don't.
+
+5. **Batter props**
+   Expand beyond pitchers to HR, hits, RBI props. Requires new scrapers, new model logic, and new prop types. Later-season project once pitcher-side model is validated.
 
 ## Kelly Criterion — Tier-Based Caps (updated 2026-04-05)
 
