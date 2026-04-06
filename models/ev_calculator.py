@@ -29,7 +29,24 @@ HIST      = os.path.join(os.path.dirname(__file__), '..', 'data', 'historical')
 
 EV_THRESHOLD = 0.04   # flag anything above 4% EV
 MIN_EV_KELLY = 0.01   # don't recommend a stake below 1% EV
-MAX_KELLY    = 0.05   # cap stake at 5% of bankroll (half-Kelly safety)
+
+# ── Tier-based Kelly caps ────────────────────────────────────────────────────
+# Each tier has a different maximum fraction of bankroll we're willing to risk.
+# Degen bets ignore Kelly math entirely and always get a flat $7 token stake.
+KELLY_CAPS = {
+    'CONSERVATIVE': 0.03,   # up to 3% of bankroll
+    'MODERATE':     0.02,   # up to 2% of bankroll
+    'AGGRESSIVE':   0.005,  # up to 0.5% of bankroll
+}
+DEGEN_FLAT_STAKE = 7.0      # flat dollar stake for any Degen (20%+ EV) signal
+
+
+def ev_tier(ev: float) -> str:
+    """Classify an EV value into its tier label."""
+    if ev >= 0.20: return 'DEGEN'
+    if ev >= 0.12: return 'AGGRESSIVE'
+    if ev >= 0.07: return 'MODERATE'
+    return 'CONSERVATIVE'
 
 # ── Batter matchup: team name → team_krates.csv code ──────────
 # team_krates uses Statcast abbreviations; pitcher_stats uses FanGraphs.
@@ -127,7 +144,8 @@ def calculate_ev(model_prob: float, american_odds: float) -> float:
     return round(ev, 4)
 
 
-def kelly_stake(model_prob: float, american_odds: float, bankroll: float = 1000.0) -> dict:
+def kelly_stake(model_prob: float, american_odds: float,
+                bankroll: float = 1000.0, max_kelly: float = 0.03) -> dict:
     """
     Kelly Criterion — how much of your bankroll to bet.
 
@@ -137,8 +155,8 @@ def kelly_stake(model_prob: float, american_odds: float, bankroll: float = 1000.
       p = model probability of winning
       q = 1 - p
 
-    We use half-Kelly (capped at MAX_KELLY) to reduce variance.
-    Returns a dict with fraction, dollar amount, and interpretation.
+    We use half-Kelly, then apply the tier-specific max_kelly cap.
+    Returns a dict with fraction, dollar amount, cap_applied flag, and note.
     """
     decimal = american_to_decimal(american_odds)
     b = decimal - 1
@@ -146,21 +164,23 @@ def kelly_stake(model_prob: float, american_odds: float, bankroll: float = 1000.
     q = 1 - p
 
     if b <= 0:
-        return {'fraction': 0, 'dollars': 0, 'note': 'Invalid odds'}
+        return {'fraction': 0, 'dollars': 0, 'cap_applied': False, 'note': 'Invalid odds'}
 
     full_kelly = (b * p - q) / b
     half_kelly = full_kelly / 2
 
     if half_kelly <= 0:
-        return {'fraction': 0, 'dollars': 0, 'note': 'Negative edge — no bet'}
+        return {'fraction': 0, 'dollars': 0, 'cap_applied': False, 'note': 'Negative edge — no bet'}
 
-    capped = min(half_kelly, MAX_KELLY)
-    dollars = round(bankroll * capped, 2)
+    cap_applied = half_kelly > max_kelly
+    capped      = min(half_kelly, max_kelly)
+    dollars     = round(bankroll * capped, 2)
 
     return {
-        'fraction': round(capped, 4),
-        'dollars':  dollars,
-        'note':     f'Half-Kelly capped at {MAX_KELLY:.0%}' if half_kelly > MAX_KELLY else 'Half-Kelly'
+        'fraction':    round(capped, 4),
+        'dollars':     dollars,
+        'cap_applied': cap_applied,
+        'note':        f'Half-Kelly capped at {max_kelly:.1%}' if cap_applied else 'Half-Kelly',
     }
 
 
@@ -565,8 +585,29 @@ def build_ev_signals(props_df:    pd.DataFrame,
         ev_over  = calculate_ev(model_over,  over_odds)
         ev_under = calculate_ev(model_under, under_odds)
 
-        kelly_over  = kelly_stake(model_over,  over_odds,  bankroll)
-        kelly_under = kelly_stake(model_under, under_odds, bankroll)
+        # ── Tier-based Kelly sizing ───────────────────────────────────────
+        # Classify each side by its EV, then apply the matching cap.
+        # Degen (20%+ EV) skips the Kelly formula entirely — flat $7 stake.
+        tier_over  = ev_tier(ev_over)
+        tier_under = ev_tier(ev_under)
+
+        if tier_over == 'DEGEN':
+            kelly_over = {
+                'fraction': 0.0, 'dollars': DEGEN_FLAT_STAKE,
+                'cap_applied': False, 'note': 'Degen flat stake',
+            }
+        else:
+            kelly_over = kelly_stake(model_over, over_odds, bankroll,
+                                     max_kelly=KELLY_CAPS[tier_over])
+
+        if tier_under == 'DEGEN':
+            kelly_under = {
+                'fraction': 0.0, 'dollars': DEGEN_FLAT_STAKE,
+                'cap_applied': False, 'note': 'Degen flat stake',
+            }
+        else:
+            kelly_under = kelly_stake(model_under, under_odds, bankroll,
+                                      max_kelly=KELLY_CAPS[tier_under])
 
         # Pull xFIP for the Discord embed (nice-to-have, not required)
         xfip_val = None
@@ -603,28 +644,30 @@ def build_ev_signals(props_df:    pd.DataFrame,
 
         # Over row
         rows.append({**base,
-            'side':          'Over',
-            'odds':          over_odds,
-            'model_prob':    model_over,
-            'implied_prob':  round(book_over_prob, 4),
-            'ev':            ev_over,
-            'kelly_pct':     kelly_over['fraction'],
-            'kelly_dollars': kelly_over['dollars'],
-            'flag':          ev_over >= EV_THRESHOLD,
-            'prob_capped':   over_capped,
+            'side':              'Over',
+            'odds':              over_odds,
+            'model_prob':        model_over,
+            'implied_prob':      round(book_over_prob, 4),
+            'ev':                ev_over,
+            'kelly_pct':         kelly_over['fraction'],
+            'kelly_dollars':     kelly_over['dollars'],
+            'kelly_cap_applied': kelly_over['cap_applied'],
+            'flag':              ev_over >= EV_THRESHOLD,
+            'prob_capped':       over_capped,
         })
 
         # Under row
         rows.append({**base,
-            'side':          'Under',
-            'odds':          under_odds,
-            'model_prob':    model_under,
-            'implied_prob':  round(book_under_prob, 4),
-            'ev':            ev_under,
-            'kelly_pct':     kelly_under['fraction'],
-            'kelly_dollars': kelly_under['dollars'],
-            'flag':          ev_under >= EV_THRESHOLD,
-            'prob_capped':   under_capped,
+            'side':              'Under',
+            'odds':              under_odds,
+            'model_prob':        model_under,
+            'implied_prob':      round(book_under_prob, 4),
+            'ev':                ev_under,
+            'kelly_pct':         kelly_under['fraction'],
+            'kelly_dollars':     kelly_under['dollars'],
+            'kelly_cap_applied': kelly_under['cap_applied'],
+            'flag':              ev_under >= EV_THRESHOLD,
+            'prob_capped':       under_capped,
         })
 
     df = pd.DataFrame(rows)
