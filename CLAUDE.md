@@ -40,7 +40,7 @@ playbook/
 ├── logs/                 # Daily pipeline logs (pipeline_YYYY-MM-DD.log)
 ├── research/             # Notes, experiments, one-off analysis
 ├── config.py             # All settings loaded from .env
-├── main.py               # Full pipeline — runs all 6 steps in order
+├── main.py               # Full pipeline — runs all 7 steps in order
 ├── run_playbook.bat      # Double-click to run manually
 ├── requirements.txt      # All dependencies
 ├── .env.example          # Template — copy to .env and fill in keys
@@ -117,8 +117,10 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - **Supabase caching**: baselines cached in `player_baselines_cache` table — skips rebuild if cache under 7 days old (saves 1-2 min on Railway)
 
 ### `models/ev_calculator.py` — WORKING
+- **Prop types supported**: `pitcher_strikeouts` (Over/Under total Ks) and `pitcher_innings` (Over/Under innings pitched)
 - **Pure math layer**: American odds conversion, EV formula, Kelly Criterion (half-Kelly, capped 5%)
-- **Poisson model**: converts K/9 + expected IP into probability of going over/under any line
+- **Poisson model**: converts K/9 + expected IP into probability of going over/under any strikeout line
+- **Normal distribution model**: for `pitcher_innings` props, uses pitcher's avg IP/start + a 1.2-inning standard deviation to compute over/under probability. Replaces Poisson (which is for counts, not continuous innings)
 - **Per-pitcher innings**: uses `avg_ip` from savant_today.csv (current 2026 IP/GS from MLB Stats API) blended against `hist_avg_ip` (2yr historical) — same early-season schedule as K/9 blending. Replaces the old fixed 5.5-inning default.
 - **Historical blending** (starts-aware hard floors):
   - 0–3 starts: 92% historical, 8% current
@@ -197,9 +199,12 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 | `DISCORD_WEBHOOK_CONSERVATIVE` | discord_alerts.py | Set |
 | `DISCORD_WEBHOOK_PAPER` | paper_trading.py | Set |
 | `DISCORD_WEBHOOK_HEALTH` | discord_alerts.py health functions | Set |
+| `DISCORD_WEBHOOK_URL` | config.py (legacy — not actively used) | Set |
 | `SUPABASE_URL` + `SUPABASE_KEY` | database.py | Set |
-| `BANKROLL` | ev_calculator.py | Set ($1000) |
+| `BANKROLL` | paper_trading.py, ev_calculator.py | Set ($1000) |
 | `ANTHROPIC_API_KEY` | discord_alerts.py Claude rationale | Set |
+| `SPORT` | config.py (optional — defaults to `baseball_mlb`) | Optional |
+| `MIN_EDGE_PERCENT` | config.py (optional — defaults to `5`) | Optional |
 
 ---
 
@@ -279,13 +284,16 @@ All tables confirmed live and accepting writes as of 2026-04-05.
 2. **Wire `send_heartbeat`** ✓ ALREADY DONE
    Called at the end of `auto_resolve` in both paths (bets resolved + no pending bets). Sends W/L record, pending count, game count to health channel. Lives in `discord_alerts.py:send_heartbeat()`.
 
-3. **Pitcher hand-off / innings cap detection**
+3. **Weather scraper** (`scrapers/weather_scraper.py`) — NOT YET BUILT
+   Fetch game-day weather conditions (wind speed/direction, temperature, dome/outdoor) for each ballpark. Outdoor stadiums with high wind-out conditions affect home run props; cold/wet weather depresses offense and can lead to more strikeouts. Would run as Step 2.6 in the pipeline (after umpires, before historical stats). Suggest using a free weather API (e.g. Open-Meteo — no key required) keyed on ballpark lat/lon coordinates.
+
+4. **Pitcher hand-off / innings cap detection**
    If a pitcher's season IP is suspiciously low for their start count, flag as potential innings cap and discount expected IP further. Protects against overvaluing K props on limited young arms (Skenes, post-injury returns).
 
-4. **Line movement tracking**
+5. **Line movement tracking**
    Log a "line at game time" snapshot in addition to opening (10:30am) and closing (resolve). Heavy movement against our position between open and game time is a signal the market knows something we don't.
 
-5. **Batter props**
+6. **Batter props**
    Expand beyond pitchers to HR, hits, RBI props. Requires new scrapers, new model logic, and new prop types. Later-season project once pitcher-side model is validated.
 
 ## Kelly Criterion — Tier-Based Caps (updated 2026-04-05)
@@ -336,7 +344,7 @@ Builds a composite historical profile for each pitcher: 2-year weighted K/9 (202
 Fetches live prop lines from DraftKings, FanDuel, and BetMGM for today's pitcher strikeout props. The lines are usually posted around 9-10am ET. This step costs API quota (500 requests/month on the free tier) so it runs once per day at 10:30am when the pipeline fires.
 
 **Step 6 — EV Calculator** (`models/ev_calculator.py`)
-This is where all the data comes together. For each live prop line, it: (1) builds a blended K/9 estimate from current + historical data, (2) applies adjustments for velocity trend, opposing lineup K-rate, and umpire zone, (3) uses a Poisson distribution to convert that K/9 into a probability of going over or under the line, (4) compares that probability to the implied probability in the book's odds, (5) calculates EV and Kelly stake. If EV is above 4%, the signal is flagged and sent to Discord.
+This is where all the data comes together. Two prop types are supported: `pitcher_strikeouts` and `pitcher_innings`. For each live prop line, it: (1) builds a blended K/9 and IP estimate from current + historical data, (2) applies adjustments for velocity trend, opposing lineup K-rate, and umpire zone (K props only), (3) uses a Poisson distribution for strikeout lines or a Normal distribution for innings lines to compute the probability of going over or under, (4) compares that probability to the implied probability in the book's odds, (5) calculates EV and Kelly stake. If EV is above 4%, the signal is flagged and sent to Discord.
 
 **Step 7 — Auto-Resolve** (`alerts/paper_trading.py auto_resolve`) — runs separately at 11:30 PM ET
 Checks every pending bet against the MLB Stats API box scores. If the game is Final, marks the bet WIN or LOSS. If the game is Postponed/Suspended/Cancelled, increments the postpone counter (and sends a health alert if a bet has been postponed 3+ times). Captures closing odds from the Odds API for CLV tracking. Sends a P&L summary to Discord.
@@ -364,8 +372,10 @@ Scales expected strikeouts by the opposing team's K-rate vs the pitcher's handed
 **Layer 5 — Umpire Adjustment**
 If the home plate umpire has a historically tight zone (above 60th percentile zone_size_pct), the model applies a +3% K boost. If he has a historically wide zone (below 40th percentile), a -3% trim. Neutral zone = no adjustment.
 
-**Layer 6 — Poisson Distribution**
-Takes the blended K/9 and expected innings, computes an expected K total, then uses the Poisson distribution to calculate the probability of going over or under any specific line (e.g., over 5.5 Ks). Poisson is the right math for count events — how many times does X happen in Y chances.
+**Layer 6 — Probability Model**
+Two models are used depending on prop type:
+- **Strikeout props**: Poisson distribution. Takes blended K/9 and expected innings, computes an expected K total, then calculates the probability of going over or under any specific line (e.g., over 5.5 Ks). Poisson is the right math for count events — how many times does X happen in Y chances.
+- **Innings props**: Normal distribution. Uses the pitcher's blended avg IP/start with a default standard deviation of 1.2 innings to model the probability of going over or under an innings line (e.g., over 5.5 IP). Innings pitched is a continuous value, so Normal distribution fits better than Poisson.
 
 **Layer 7 — Safety Filters**
 Two filters prevent the model from being overconfident on structurally risky bets:
