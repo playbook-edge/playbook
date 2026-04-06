@@ -49,27 +49,28 @@ playbook/
 
 ---
 
-## Full Pipeline (main.py — 6 steps)
+## Full Pipeline (main.py — 7 steps)
 
 Run manually: `python main.py`
 Scheduled via: **Railway** cron at 10:30 AM ET (`30 14 * * *`) — no Windows Task Scheduler needed.
 
 ```
-Step 1  scrapers/baseball_savant.py   →  data/raw/savant_today.csv
-Step 2  scrapers/fangraphs.py         →  data/raw/pitcher_stats.csv
-                                          data/raw/team_krates.csv
-Step 3  scrapers/historical_stats.py  →  data/historical/pitcher_stats_2024.csv
-                                          data/historical/pitcher_stats_2025.csv
-                                          data/historical/pitcher_stats_all.csv
-Step 4  models/player_baseline.py     →  data/historical/player_baselines.csv
-Step 5  scrapers/odds_api.py          →  data/raw/todays_props.csv
-Step 6  models/ev_calculator.py       →  data/processed/ev_signals.csv
-                                          → fires Discord alerts automatically
+Step 1    scrapers/baseball_savant.py   →  data/raw/savant_today.csv
+Step 2    scrapers/fangraphs.py         →  data/raw/pitcher_stats.csv
+                                            data/raw/team_krates.csv
+Step 2.5  scrapers/umpire_scraper.py    →  Supabase: umpire_profiles (weekly refresh)
+Step 3    scrapers/historical_stats.py  →  data/historical/pitcher_stats_2024.csv
+                                            data/historical/pitcher_stats_2025.csv
+                                            data/historical/pitcher_stats_all.csv
+Step 4    models/player_baseline.py     →  data/historical/player_baselines.csv
+Step 5    scrapers/odds_api.py          →  data/raw/todays_props.csv
+Step 6    models/ev_calculator.py       →  data/processed/ev_signals.csv
+                                            → fires Discord alerts automatically
 ```
 
 Each step is isolated — one failure doesn't stop the rest.
 On failure, `send_error_alert()` fires immediately to the health channel.
-After all 6 steps, `send_pipeline_summary()` fires to the health channel.
+After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 
 ---
 
@@ -132,15 +133,27 @@ After all 6 steps, `send_pipeline_summary()` fires to the health channel.
 - Flags any prop above 4% EV; saves full results to `ev_signals.csv`
 - ev_signals.csv new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `prob_capped`, `low_line_note`
 
+### `scrapers/umpire_scraper.py` — WORKING
+- **Part 1 — profiles (weekly)**: fetches umpire zone tendency data from `umpscorecards.com/api/umpires?season={year}`
+- Computes `zone_size_pct` (0-100): percentile rank of how pitcher-friendly each umpire's zone is. Derived by INVERTING the rank of `total_run_impact_mean` — lower run impact = fewer runs from missed calls = more pitcher-friendly = higher zone_size_pct.
+- Saves 100+ profiles to Supabase `umpire_profiles` table; weekly refresh (re-fetches if cache is older than 7 days)
+- **Part 2 — today's assignments**: calls MLB Stats API `?sportId=1&date={TODAY}&hydrate=officials` to find the home plate umpire for each game
+- Matches to profiles by normalized full name (umpscorecards has no MLB umpire IDs)
+- Returns a dict keyed by `'{away} @ {home}'` matchup string — same format as ev_signals.csv matchup column
+- **K factor**: zone_pct > 60 → +3% K boost; zone_pct < 40 → -3% K trim; else neutral
+
 ### `alerts/paper_trading.py` — WORKING
 - Logs every flagged bet to `data/processed/paper_trades.csv` (called automatically by ev_calculator)
 - Sends "BET PLACED" embed to `DISCORD_WEBHOOK_PAPER` channel for each trade
 - Sends running P&L summary embed after all bets are placed
 - **Auto-resolve**: `python alerts/paper_trading.py auto_resolve` — hits MLB Stats API box scores, marks each PENDING bet WIN or LOSS, fires updated P&L to Discord
+  - Checks game status first: Final → resolve; In Progress → skip; Postponed/Suspended/Cancelled → increment postpone_count, health alert at 3
+  - Captures closing odds from Odds API and logs CLV (closing_implied_prob - opening_implied_prob) per resolved bet
+  - Avg CLV reported in nightly P&L Discord embed
 - **Manual resolve**: `python alerts/paper_trading.py resolve` — interactive fallback
 - **Scheduled**: Railway cron service `playbook-resolve` runs at 11:30 PM ET (`30 3 * * *`)
 - Bankroll starts at $1,000 (set via `BANKROLL` in `.env`)
-- Trade columns: date, player, prop_type, side, line, odds, ev, stake, bankroll_before, bankroll_after, result, payout, net, matchup, book
+- Trade columns: date, player, prop_type, side, line, odds, ev, stake, bankroll_before, bankroll_after, result, payout, net, matchup, book, postpone_count
 
 ### `alerts/discord_alerts.py` — WORKING
 - **Daily card** (`send_daily_card`): the main alert function — sends all flagged bets as one Discord message (one embed per bet, stacked). Called from ev_calculator.py after each run.
@@ -186,7 +199,7 @@ After all 6 steps, `send_pipeline_summary()` fires to the health channel.
 | `DISCORD_WEBHOOK_HEALTH` | discord_alerts.py health functions | Set |
 | `SUPABASE_URL` + `SUPABASE_KEY` | database.py | Set |
 | `BANKROLL` | ev_calculator.py | Set ($1000) |
-| `ANTHROPIC_API_KEY` | discord_alerts.py Claude rationale | Not set — falls back to rule-based |
+| `ANTHROPIC_API_KEY` | discord_alerts.py Claude rationale | Set |
 
 ---
 
@@ -248,9 +261,18 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 |-------|---------|---------|
 | `ev_signals` | Every flagged bet the model finds | Daily |
 | `paper_trades` | Simulated bets + WIN/LOSS results | Per bet |
+| `closing_lines` | Closing odds captured at resolve time for CLV tracking | Per resolved bet |
 | `pipeline_runs` | Log of each daily execution | Daily |
-| `team_krates_cache` | Team K% vs RHP/LHP | Daily |
+| `team_krates_cache` | Team K% vs RHP/LHP (running PA/K totals for incremental updates) | Daily (incremental) |
+| `statcast_pull_log` | Tracks last Statcast pull date to enable incremental delta fetches | Daily |
 | `player_baselines_cache` | 935-pitcher historical composites | Weekly |
+| `umpire_profiles` | Umpire zone tendency data from umpscorecards.com | Weekly |
+
+**Pending SQL to run in Supabase SQL Editor** (tables/columns not yet created):
+- `statcast_pull_log` table + `k_vs_rhp`/`k_vs_lhp` columns on `team_krates_cache`
+- `umpire_profiles` table
+- `closing_lines` table
+- `postpone_count INTEGER DEFAULT 0` column on `paper_trades`
 
 ## What to Build Next (rough order)
 
@@ -260,7 +282,119 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 
 ---
 
-## Coding Rules for This Project
+---
+
+## Architecture Overview (Plain English)
+
+### What Playbook Does
+
+Playbook is an automated baseball betting research tool. Every morning during the MLB season, it wakes up, collects data from five different sources, runs a probability model, compares the model's opinion to what the sportsbooks are offering, and if it finds a bet where the math says we have an edge, it sends a formatted alert to Discord. At night, it checks the game results and scores each bet as a WIN or LOSS. Everything is tracked so we can measure whether the model is actually right over time.
+
+---
+
+### The Daily Pipeline (7 Steps)
+
+**Step 1 — Baseball Savant** (`scrapers/baseball_savant.py`)
+Finds today's probable starting pitchers from the MLB Stats API (free, no key needed). For each pitcher, pulls their last 30 days of Statcast data: strikeout rate, fastball velocity, velocity trend (is he throwing harder or softer than his average this month?), spin rate, and pitch mix. Also fetches their current 2026 innings-per-start average and their historical innings-per-start from 2024-2025 for blending. Saves everything to `savant_today.csv`.
+
+**Step 2 — FanGraphs** (`scrapers/fangraphs.py`)
+Pulls two things: (1) a season-long pitching leaderboard with xFIP and K/9 for every pitcher with meaningful innings, and (2) how often each of the 30 MLB teams strikes out against right-handed vs left-handed pitching. The team K-rates are pulled incrementally — it only fetches new days since the last pull and adds those to the running totals, instead of re-pulling the whole season every day. Both are saved to CSV and cached in Supabase.
+
+**Step 2.5 — Umpire Profiles** (`scrapers/umpire_scraper.py`)
+Fetches umpire zone tendency data from umpscorecards.com. Computes a `zone_size_pct` score for each umpire (0-100) reflecting how pitcher-friendly their zone is — high score means tight zone, more strikeouts; low score means a wide zone, fewer strikeouts. Also calls the MLB Stats API to find today's home plate umpire assignment for each game. Profiles are cached in Supabase and only re-fetched weekly (umpire tendencies don't change day-to-day).
+
+**Step 3 — Historical Stats** (`scrapers/historical_stats.py`)
+Pulls the full 2024 and 2025 FanGraphs season stats for every pitcher. These are cached to disk and only re-fetched at the end of each season. Combined into `pitcher_stats_all.csv` which is the foundation for the baseline model.
+
+**Step 4 — Player Baselines** (`models/player_baseline.py`)
+Builds a composite historical profile for each pitcher: 2-year weighted K/9 (2025 counts double), reliability score (0-100 based on innings, seasons, consistency), and a trend arrow (UP/DOWN/STABLE/NEW comparing current season to historical average). Cached in Supabase for up to 7 days.
+
+**Step 5 — Odds API** (`scrapers/odds_api.py`)
+Fetches live prop lines from DraftKings, FanDuel, and BetMGM for today's pitcher strikeout props. The lines are usually posted around 9-10am ET. This step costs API quota (500 requests/month on the free tier) so it runs once per day at 10:30am when the pipeline fires.
+
+**Step 6 — EV Calculator** (`models/ev_calculator.py`)
+This is where all the data comes together. For each live prop line, it: (1) builds a blended K/9 estimate from current + historical data, (2) applies adjustments for velocity trend, opposing lineup K-rate, and umpire zone, (3) uses a Poisson distribution to convert that K/9 into a probability of going over or under the line, (4) compares that probability to the implied probability in the book's odds, (5) calculates EV and Kelly stake. If EV is above 4%, the signal is flagged and sent to Discord.
+
+**Step 7 — Auto-Resolve** (`alerts/paper_trading.py auto_resolve`) — runs separately at 11:30 PM ET
+Checks every pending bet against the MLB Stats API box scores. If the game is Final, marks the bet WIN or LOSS. If the game is Postponed/Suspended/Cancelled, increments the postpone counter (and sends a health alert if a bet has been postponed 3+ times). Captures closing odds from the Odds API for CLV tracking. Sends a P&L summary to Discord.
+
+---
+
+### The Model in Detail (9 Layers)
+
+**Layer 1 — K/9 Blending**
+Uses the current 2026 K/9 from Statcast but blends it with the 2-year historical baseline using hard floors based on starts pitched. The fewer starts a pitcher has, the more we trust their history over their current small sample:
+- 0-3 starts: 92% historical, 8% current
+- 4-6 starts: 80% historical, 20% current
+- 7-9 starts: gradual ramp from 80% toward normal weighting
+- 10+ starts: normal reliability-based weight (roughly 30-50% historical depending on reliability score)
+
+**Layer 2 — Innings Estimate**
+How many innings will the starter pitch? Uses the same blending schedule as K/9 — current 2026 IP/GS (from MLB Stats API) blended against 2-year historical. Early in the season, a pitcher with 2 starts might have 2.8 IP/start due to a rough outing — blending with their historical 5.8 pulls the estimate back toward reality. Replaces the old fixed 5.5-inning default.
+
+**Layer 3 — Velocity Trend**
+If a pitcher's average fastball velocity over the last 7 days is different from his 30-day average, the model adjusts K probability: +1.5% per MPH up, -1.5% per MPH down, capped at +/-6%. A guy throwing 1 MPH harder recently gets a 1.5% K boost; one who's clearly lost velocity gets a trim.
+
+**Layer 4 — Batter Matchup**
+Scales expected strikeouts by the opposing team's K-rate vs the pitcher's handedness (R or L). If a right-handed pitcher is facing a team that strikes out 28% of the time against right-handers (vs a 22% league average), their expected Ks scale up proportionally.
+
+**Layer 5 — Umpire Adjustment**
+If the home plate umpire has a historically tight zone (above 60th percentile zone_size_pct), the model applies a +3% K boost. If he has a historically wide zone (below 40th percentile), a -3% trim. Neutral zone = no adjustment.
+
+**Layer 6 — Poisson Distribution**
+Takes the blended K/9 and expected innings, computes an expected K total, then uses the Poisson distribution to calculate the probability of going over or under any specific line (e.g., over 5.5 Ks). Poisson is the right math for count events — how many times does X happen in Y chances.
+
+**Layer 7 — Safety Filters**
+Two filters prevent the model from being overconfident on structurally risky bets:
+- Probability ceiling: capped at 75% before EV calculation. Even if the math says 91% confidence, we cap it — real-world variance (early hook, rain, quick inning) makes near-certainty unreliable.
+- Low line discount: lines of 3.5 Ks or under are heavily sensitive to game script. Model prob is discounted: x0.88 for lines ≤3.5, x0.80 for lines ≤2.5.
+
+**Layer 8 — EV Calculation**
+`EV = (model_prob × payout) - (1 - model_prob)`. Any result above 4% (0.04) gets flagged. Real edges on live props will typically be 1-6%, not 20-40% (the latter only appear in testing with synthetic data where lines are set at expected value).
+
+**Layer 9 — Kelly Sizing**
+Half-Kelly criterion, capped at 5% of bankroll. Sizes the bet proportionally to the edge — bigger edge, bigger stake. Half-Kelly is used instead of full Kelly to reduce variance.
+
+---
+
+### Data Storage (Supabase)
+
+All persistence goes through Supabase because Railway's filesystem is ephemeral — files written during a run are gone after the container restarts.
+
+| Table | What's in it |
+|-------|-------------|
+| `ev_signals` | Every flagged bet the model finds, every day — player, line, odds, EV, model prob, K/9 inputs, umpire adjustment |
+| `paper_trades` | Every simulated bet placed, with result (WIN/LOSS/PENDING) and P&L |
+| `closing_lines` | Closing odds captured at resolve time; used to calculate CLV |
+| `team_krates_cache` | Running PA and K totals per team per handedness; just 30 rows, updated incrementally each day |
+| `statcast_pull_log` | Tracks what date we last pulled Statcast data; enables incremental delta fetches |
+| `player_baselines_cache` | 935-pitcher historical composites; rebuilt weekly |
+| `umpire_profiles` | Umpire zone tendency data; rebuilt weekly |
+| `pipeline_runs` | Log of every daily pipeline execution with step pass/fail counts |
+
+---
+
+### Output Layer (Discord)
+
+Three Discord channels receive different types of messages:
+
+**Bet channel** (`DISCORD_WEBHOOK_CONSERVATIVE`): The main alert channel. Each flagged bet appears as a formatted embed with: tier badge (Conservative/Moderate/Aggressive/Degen), PlaybookIQ score (0-100 composite), book and odds, game time, velocity trend emoji, K-rate rank sentence, and a 2-3 sentence Claude AI narrative in plain English. The model's internal numbers (EV%, edge%, Kelly stake) are deliberately hidden — the UI is designed for a casual bettor, not a quant.
+
+**Paper trading channel** (`DISCORD_WEBHOOK_PAPER`): Receives a "BET PLACED" embed for each simulated bet, then a P&L summary embed. At night after resolve runs, a results summary with CLV is sent here.
+
+**Health channel** (`DISCORD_WEBHOOK_HEALTH`): Internal monitoring only. Receives: pipeline summary after each run (steps passed/failed, runtime, signal count by tier), immediate error alerts if any step fails, postponement alerts when a bet has been postponed 3+ times.
+
+---
+
+### The CLV Loop (Why It Matters)
+
+Closing Line Value is the most important signal for whether the model is actually good or just getting lucky. Here's how it works:
+
+When we place a bet, we capture the odds at that moment (e.g., -110 on over 5.5 Ks). When the game resolves, we also capture the closing odds — what the book was offering right before the game started (e.g., -130 on the same bet). Converting both to implied probabilities, CLV = closing_implied_prob - opening_implied_prob. In this example: -130 implied prob is ~56.5%, -110 is ~52.4%, so CLV = +4.1%.
+
+Positive CLV means the market moved toward our position after we bet — we got a better price than the final market consensus. This is the primary signal that the model is finding real edges rather than noise. Over a full season, if avg CLV is consistently positive, that's strong evidence to move from paper to real money.
+
+---
 
 - No coding experience on the owner's side — always explain what you built and why in plain English after writing code
 - Test every script immediately after writing it and fix errors before handing back
