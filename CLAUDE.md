@@ -268,17 +268,28 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 | `player_baselines_cache` | 935-pitcher historical composites | Weekly |
 | `umpire_profiles` | Umpire zone tendency data from umpscorecards.com | Weekly |
 
-**Pending SQL to run in Supabase SQL Editor** (tables/columns not yet created):
-- `statcast_pull_log` table + `k_vs_rhp`/`k_vs_lhp` columns on `team_krates_cache`
-- `umpire_profiles` table
-- `closing_lines` table
-- `postpone_count INTEGER DEFAULT 0` column on `paper_trades`
+All tables confirmed live and accepting writes as of 2026-04-05.
 
 ## What to Build Next (rough order)
 
 1. **Wire `send_heartbeat`** — call from the resolve script so health channel gets a daily ping after results are processed
 2. **Batter props** — expand beyond pitchers to hit/HR/RBI props
 3. **Result accuracy tracking** — measure model calibration as the season progresses
+
+## Kelly Criterion — Tier-Based Caps (updated 2026-04-05)
+
+Stakes are no longer a flat 5% cap. Each tier has its own maximum:
+
+| Tier | EV Range | Max % of bankroll | Max $ on $1,000 |
+|------|----------|-------------------|-----------------|
+| Conservative | 4–7% | 3% | $30 |
+| Moderate | 7–12% | 2% | $20 |
+| Aggressive | 12–20% | 0.5% | $5 |
+| Degen | 20%+ | flat $7 (Kelly ignored) | $7 |
+
+Logic: higher claimed EV on synthetic/early-season data is a red flag, not a green light. Degen signals on synthetic props can show 40-60% EV which is meaningless — the $7 flat stake keeps them logged in paper trading without risking real bankroll. Conservative 4-7% signals on live props are the most credible, so they get the most room.
+
+`kelly_cap_applied` column in ev_signals.csv: `True` when the cap was hit and Kelly wanted more, `False` when Kelly naturally came in under (or Degen flat override).
 
 ---
 
