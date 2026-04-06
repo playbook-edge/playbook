@@ -82,6 +82,10 @@ def step_umpires():
     from scrapers.umpire_scraper import build_umpire_profiles
     build_umpire_profiles()
 
+def step_weather():
+    from scrapers.weather_scraper import get_todays_weather
+    get_todays_weather()
+
 def step_historical():
     from scrapers.historical_stats import run
     run()
@@ -127,6 +131,7 @@ def main():
         ('Baseball Savant',  'Step 1/7  Baseball Savant',   step_savant),
         ('FanGraphs',        'Step 2/7  FanGraphs',         step_fangraphs),
         ('Umpires',          'Step 2.5/7  Umpire Profiles', step_umpires),
+        ('Weather',          'Step 2.6/7  Weather',         step_weather),
         ('Historical Stats', 'Step 3/7  Historical Stats',  step_historical),
         ('Player Baselines', 'Step 4/7  Player Baselines',  step_baseline),
         ('Odds API',         'Step 5/7  Odds API',          step_odds),
@@ -148,12 +153,17 @@ def main():
     # Count flagged signals and compute per-tier breakdown from today's run
     signal_count   = 0
     tier_breakdown = None
+    suspect_count  = 0
     try:
         import pandas as pd
         signals_path = os.path.join(ROOT, 'data', 'processed', 'ev_signals.csv')
         if os.path.exists(signals_path):
             sig_df = pd.read_csv(signals_path)
             signal_count = int(sig_df['flag'].sum()) if 'flag' in sig_df.columns else 0
+
+            # Count ev_suspect signals flagged this run
+            if 'ev_suspect' in sig_df.columns:
+                suspect_count = int(sig_df['ev_suspect'].sum())
 
             # Compute how many alerts were sent per tier (same caps as fire_alerts_from_signals)
             TIER_CAPS = {'CONSERVATIVE': 5, 'MODERATE': 4, 'AGGRESSIVE': 3, 'DEGEN': 1}
@@ -185,7 +195,8 @@ def main():
     try:
         from alerts.discord_alerts import send_pipeline_summary
         send_pipeline_summary(results_str, runtime_seconds=runtime,
-                              signal_count=signal_count, tier_breakdown=tier_breakdown)
+                              signal_count=signal_count, tier_breakdown=tier_breakdown,
+                              suspect_count=suspect_count)
     except Exception as e:
         logger.log(f'  Health summary failed: {e}')
 

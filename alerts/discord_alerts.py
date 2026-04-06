@@ -421,14 +421,14 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
 # ─────────────────────────────────────────────
 
 def fire_alerts_from_signals(signals_df: pd.DataFrame,
-                              ev_threshold: float = 0.04,
+                              ev_threshold: float = 0.02,
                               webhook_url: str = None) -> int:
     """
     Send Discord alerts for all rows above ev_threshold using tiered caps.
 
     Caps per tier (signals sorted by PlaybookIQ descending within each tier
     so the highest-quality plays fire first when a tier is over its cap):
-      Conservative  4–7%  EV  →  max 5
+      Conservative  2–7%  EV  →  max 5
       Moderate      7–12% EV  →  max 4
       Aggressive   12–20% EV  →  max 3
       Degen         20%+  EV  →  max 1
@@ -501,7 +501,8 @@ def fire_alerts_from_signals(signals_df: pd.DataFrame,
 def send_pipeline_summary(results: dict,
                           runtime_seconds: int = None,
                           signal_count: int = None,
-                          tier_breakdown: dict = None):
+                          tier_breakdown: dict = None,
+                          suspect_count: int = 0):
     """
     Send a pipeline run summary to the health channel.
 
@@ -558,6 +559,7 @@ def send_pipeline_summary(results: dict,
     print(f'  Runtime        : {runtime_str}')
     print(f'  Signals flagged: {signals_str}')
     print(f'  Alerts by tier : {tier_str_term}')
+    print(f'  Suspect (EV>15%): {suspect_count}')
     print(f'  Next run       : Tomorrow 10:30 AM ET')
     print(f'  Timestamp      : {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
     print('-' * 50 + '\n')
@@ -574,6 +576,8 @@ def send_pipeline_summary(results: dict,
     embed.add_embed_field(name='Signals flagged',  value=signals_str,          inline=True)
     embed.add_embed_field(name='Next run',         value='Tomorrow 10:30 AM ET', inline=True)
     embed.add_embed_field(name='Alerts by tier',   value=tier_str,             inline=False)
+    if suspect_count > 0:
+        embed.add_embed_field(name='⚠️ Suspect signals (EV>15%)', value=str(suspect_count) + ' excluded from alerts', inline=False)
     embed.set_footer(text=f'Playbook Health  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
     embed.set_timestamp()
     hook.add_embed(embed)
@@ -779,7 +783,7 @@ def _daily_card_narrative(signal: dict, krate_sentence: str) -> str:
 
 
 def send_daily_card(signals_df: pd.DataFrame,
-                    ev_threshold: float = 0.04,
+                    ev_threshold: float = 0.02,
                     max_bets: int = 5,
                     webhook_url: str = None,
                     dry_run: bool = False) -> int:
@@ -807,6 +811,14 @@ def send_daily_card(signals_df: pd.DataFrame,
         print(f'  No signals above {ev_threshold:.0%} EV -- no daily card sent.')
         return 0
 
+    # Always show one 🎰 Degen pick. If no signal naturally qualifies (EV >= 20%),
+    # force-promote the top-ranked signal to the Degen badge so there's always a
+    # "best bet of the day" regardless of how tight the market is.
+    has_natural_degen = (flagged['ev'] >= 0.20).any()
+    flagged['_force_degen'] = False
+    if not has_natural_degen:
+        flagged.iloc[0, flagged.columns.get_loc('_force_degen')] = True
+
     # Load team K-rates for ranking
     krates_df = None
     try:
@@ -833,10 +845,13 @@ def send_daily_card(signals_df: pd.DataFrame,
         xfip    = signal.get('xfip')
         ip_ps   = signal.get('ip_per_start')
 
-        # Tier — swap DEGEN emoji to casino chip per spec
+        # Tier — swap DEGEN emoji to casino chip per spec.
+        # Force-promoted top pick also gets the 🎰 badge.
         tier_label, color, tier_emoji = get_tier(ev)
-        if tier_label == 'DEGEN':
+        if tier_label == 'DEGEN' or signal.get('_force_degen'):
+            tier_label = 'DEGEN'
             tier_emoji = '\U0001f3b0'   # 🎰
+            color      = 0x9B59B6       # purple — same as natural Degen
 
         # IQ bar — ▓░ for Discord, ##.. for terminal
         iq_score       = calculate_playbook_iq(ev, edge, xfip, ip_ps)
@@ -890,6 +905,24 @@ def send_daily_card(signals_df: pd.DataFrame,
         ]
         if krate_sentence:
             desc_lines.append(krate_sentence)
+
+        # Weather line — between K-rate and narrative
+        wind_label   = signal.get('weather_wind_label')
+        wind_factor  = float(signal.get('weather_wind_factor') or 0)
+        precip       = signal.get('weather_precip_pct')
+        temp_f       = signal.get('weather_temp_f')
+        if wind_label and str(wind_label) not in ('None', 'nan', ''):
+            if str(wind_label) == 'Dome':
+                wx_emoji = '\U0001f3df\ufe0f'   # 🏟️
+            elif float(precip or 0) >= 30:
+                wx_emoji = '\U0001f327\ufe0f'   # 🌧️
+            elif abs(wind_factor) > 0:
+                wx_emoji = '\U0001f32c\ufe0f'   # 🌬️
+            else:
+                wx_emoji = '\u2600\ufe0f'        # ☀️
+            temp_str = f'  \u00b7  {float(temp_f):.0f}\u00b0F' if temp_f not in (None, '') and str(temp_f) not in ('None', 'nan') else ''
+            desc_lines.append(f'{wx_emoji}  {wind_label}{temp_str}')
+
         desc_lines += ['', narrative]
         desc = '\n'.join(desc_lines)
 
@@ -916,6 +949,8 @@ def send_daily_card(signals_df: pd.DataFrame,
         print(f'  Trend   : {trend_label}')
         if krate_sentence:
             print(f'  K-rate  : {krate_sentence}')
+        if wind_label and str(wind_label) not in ('None', 'nan', ''):
+            print(f'  Weather : {wind_label}{temp_str}')
         print(f'  Narrative: {narrative}')
         if not is_last:
             print('\n  ' + '- ' * 24)

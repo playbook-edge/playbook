@@ -27,7 +27,7 @@ RAW       = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
 PROCESSED = os.path.join(os.path.dirname(__file__), '..', 'data', 'processed')
 HIST      = os.path.join(os.path.dirname(__file__), '..', 'data', 'historical')
 
-EV_THRESHOLD = 0.04   # flag anything above 4% EV
+EV_THRESHOLD = 0.02   # flag anything above 2% EV
 MIN_EV_KELLY = 0.01   # don't recommend a stake below 1% EV
 
 # ── Tier-based Kelly caps ────────────────────────────────────────────────────
@@ -342,13 +342,45 @@ def lookup_opp_krate(pitcher_team: str, matchup: str,
     return opp_code, round(opp_k_pct, 3), factor
 
 
+def _weather_cols(matchup: str, weather_lookup: dict) -> dict:
+    """
+    Look up weather for the home team of this matchup.
+    Handles both "Away @ Home" format (live props) and bare team
+    name/code (synthetic props).
+    Returns a dict of four weather columns (all None/0 if no data).
+    """
+    m = str(matchup).strip()
+    home_str  = m.split(' @ ')[-1].strip() if ' @ ' in m else m
+    home_code = team_name_to_code(home_str) if home_str else None
+    wx        = weather_lookup.get(home_code) if home_code else None
+
+    if wx is None:
+        return {
+            'weather_wind_label':  None,
+            'weather_wind_factor': 0.0,
+            'weather_temp_f':      None,
+            'weather_precip_pct':  None,
+        }
+
+    temp  = wx.get('temperature_f')
+    prec  = wx.get('precip_pct')
+    return {
+        'weather_wind_label':  str(wx.get('wind_label', '')),
+        'weather_wind_factor': float(wx.get('wind_factor', 0.0)),
+        'weather_temp_f':      float(temp) if temp is not None and pd.notna(temp) else None,
+        'weather_precip_pct':  int(float(prec)) if prec is not None and pd.notna(prec) else None,
+    }
+
+
 def build_ev_signals(props_df:    pd.DataFrame,
                      savant_df:   pd.DataFrame,
                      stats_df:    pd.DataFrame,
                      bankroll:    float = 1000.0,
                      baselines_df: pd.DataFrame | None = None,
                      krates_df:   pd.DataFrame | None = None,
-                     umpire_data: dict | None = None) -> pd.DataFrame:
+                     umpire_data: dict | None = None,
+                     all_stats_df: pd.DataFrame | None = None,
+                     weather_df:  pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Core matching and EV calculation.
 
@@ -368,8 +400,39 @@ def build_ev_signals(props_df:    pd.DataFrame,
 
     rows = []
 
+    # Build weather lookup: team_code → row from weather_today.csv
+    weather_lookup: dict = {}
+    if weather_df is not None and not weather_df.empty:
+        for _, wr in weather_df.iterrows():
+            code = str(wr.get('home_team', '')).strip().upper()
+            if code:
+                weather_lookup[code] = wr
+
+    # Build total historical GS lookup: {normalized_name: total_GS_2024+2025}.
+    # Pitchers with fewer than 8 combined starts across both seasons are flagged
+    # as low_history — injury returnees or prospects with too small a track record
+    # to trust even the historical baseline.
+    all_stats_gs: dict = {}
+    if all_stats_df is not None:
+        gs_col   = 'GS' if 'GS' in all_stats_df.columns else (
+                   'starts' if 'starts' in all_stats_df.columns else None)
+        name_col = 'Name' if 'Name' in all_stats_df.columns else 'name'
+        if gs_col and name_col in all_stats_df.columns:
+            for _, arow in all_stats_df.iterrows():
+                nkey = normalize_name(str(arow.get(name_col, '')))
+                if nkey:
+                    all_stats_gs[nkey] = all_stats_gs.get(nkey, 0) + int(arow.get(gs_col, 0) or 0)
+
     for _, prop in props_df.iterrows():
         player = prop['player']
+
+        # ── Low history detection ─────────────────────────────────────────────
+        # Check combined career GS across 2024+2025 from pitcher_stats_all.csv.
+        # Fewer than 8 starts = not enough history to trust the baseline,
+        # regardless of current season start count.
+        norm_player   = normalize_name(player)
+        total_hist_gs = all_stats_gs.get(norm_player, 0)
+        low_history   = total_hist_gs < 8
 
         # --- Match to FanGraphs stats (K/9, IP per start) ---
         stats_name = match_name(player, stats_df['name'])
@@ -423,7 +486,12 @@ def build_ev_signals(props_df:    pd.DataFrame,
                 # 4-6 starts: 80% historical, 20% current
                 # 7-9 starts: ramp from base_hist + early_bonus toward normal
                 # 10+ starts: normal reliability-based weight (no floor)
-                if curr_starts < 4:
+                if low_history:
+                    # Injury returnee / low career track record.
+                    # Force 95% historical regardless of current start count —
+                    # we barely know this version of the pitcher yet.
+                    hist_weight = 0.95
+                elif curr_starts < 4:
                     hist_weight = 0.92
                 elif curr_starts <= 6:
                     hist_weight = 0.80
@@ -570,11 +638,11 @@ def build_ev_signals(props_df:    pd.DataFrame,
                 model_under = round(model_under * 0.88, 4)
                 low_line_note = 'Low line discount 0.88x (line <= 3.5)'
 
-        # ── Fix 1: Model probability ceiling ─────────────────────────────────
-        # Cap any single-side probability at 75% before it enters EV.
-        # Poisson can output near-certainty on easy lines but those
-        # estimates are unreliable — no prop is a lock.
-        PROB_CEILING = 0.75
+        # ── Model probability ceiling ─────────────────────────────────────────
+        # Cap probability before it enters EV.
+        # Normal ceiling: 0.70 (down from 0.75 — real-world variance warrants caution).
+        # Low-history ceiling: 0.65 — even less confidence on returnees/prospects.
+        PROB_CEILING = 0.65 if low_history else 0.70
         over_capped  = model_over  > PROB_CEILING
         under_capped = model_under > PROB_CEILING
         model_over   = min(model_over,  PROB_CEILING)
@@ -640,6 +708,10 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'low_line_note':     low_line_note,
             'umpire_name':       umpire_name,
             'umpire_adjustment': round(umpire_adjustment, 3),
+            'low_history':       low_history,
+            'ev_suspect':        False,   # overwritten in run() for live props with EV > 15%
+            # ── Weather context (informational — not applied to Poisson model) ──
+            **_weather_cols(prop.get('matchup', ''), weather_lookup),
         }
 
         # Over row
@@ -794,6 +866,14 @@ def run():
     else:
         print('No historical baselines found — run scrapers/historical_stats.py and models/player_baseline.py')
 
+    # Load combined 2024+2025 stats for low_history detection (injury returnees / prospects)
+    all_stats_path = os.path.join(HIST, 'pitcher_stats_all.csv')
+    all_stats_df   = pd.read_csv(all_stats_path) if os.path.exists(all_stats_path) else None
+    if all_stats_df is not None:
+        print(f'All-season stats loaded: {len(all_stats_df)} rows (2024+2025) — low_history detection active')
+    else:
+        print('No all-season stats found — low_history detection disabled')
+
     print(f'Pitchers in FanGraphs stats: {len(stats_df)}')
     print(f'Pitchers in Statcast data:   {len(savant_df)}')
     print(f'Prop lines to evaluate:      {len(props_df)}')
@@ -805,6 +885,14 @@ def run():
         print(f'Team K-rates loaded: {len(krates_df)} teams')
     else:
         print('No team K-rates found — run scrapers/fangraphs.py first')
+
+    # Load weather (optional — degrades gracefully if missing)
+    weather_path = os.path.join(RAW, 'weather_today.csv')
+    weather_df   = pd.read_csv(weather_path) if os.path.exists(weather_path) else None
+    if weather_df is not None:
+        print(f'Weather loaded: {len(weather_df)} stadiums')
+    else:
+        print('No weather data — run scrapers/weather_scraper.py first')
 
     # Load umpire data (optional — degrades gracefully if unavailable)
     umpire_data = None
@@ -822,13 +910,25 @@ def run():
 
     bankroll = 1000.0
     signals  = build_ev_signals(props_df, savant_df, stats_df, bankroll,
-                                baselines_df, krates_df, umpire_data)
+                                baselines_df, krates_df, umpire_data, all_stats_df,
+                                weather_df)
 
     if signals.empty:
         print('\nNo signals generated — check that pitcher names match across files.')
         return
 
-    # Save full results
+    # ── EV sanity cap — suspect flagging ─────────────────────────────────────
+    # Any live prop showing EV > 15% is almost certainly a data anomaly or
+    # model error. Flag it ev_suspect = True. It still gets logged to CSV and
+    # Supabase so we have a paper trail, but it is excluded from Discord alerts
+    # and paper trading so we never act on it.
+    if not using_synthetic:
+        signals.loc[signals['ev'] > 0.18, 'ev_suspect'] = True
+    suspect_count = int(signals['ev_suspect'].sum()) if not signals.empty else 0
+    if suspect_count > 0:
+        print(f'\n  ⚠  {suspect_count} signal(s) flagged ev_suspect (EV > 15% on live prop) — logged but excluded from Discord')
+
+    # Save full results (includes suspect signals — for the paper trail)
     out_path = os.path.join(PROCESSED, 'ev_signals.csv')
     signals.to_csv(out_path, index=False)
     print(f'\nFull results saved to: {os.path.normpath(out_path)}')
@@ -880,11 +980,15 @@ def run():
         print(f'  Real props will show tighter edges (1-6% on good plays, not 10-40%).')
         print(f'  Degen-tier alerts on synthetic data are expected and not meaningful.')
 
+    # Alerts and paper trades exclude ev_suspect signals.
+    # Suspects are still in ev_signals.csv and Supabase for the paper trail.
+    alerts_df = signals[~signals['ev_suspect']].copy() if 'ev_suspect' in signals.columns else signals
+
     # --- Fire Discord daily card ---
     print(f'\n--- Firing Discord Daily Card ---')
     try:
         from alerts.discord_alerts import send_daily_card
-        send_daily_card(signals, ev_threshold=EV_THRESHOLD, max_bets=5)
+        send_daily_card(alerts_df, ev_threshold=EV_THRESHOLD, max_bets=5)
     except Exception as e:
         print(f'  Alert error: {e}')
 
@@ -892,7 +996,7 @@ def run():
     print(f'\n--- Logging Paper Trades ---')
     try:
         from alerts.paper_trading import log_bets_from_signals
-        log_bets_from_signals(signals, ev_threshold=EV_THRESHOLD, max_bets=5)
+        log_bets_from_signals(alerts_df, ev_threshold=EV_THRESHOLD, max_bets=5)
     except Exception as e:
         print(f'  Paper trading error: {e}')
 

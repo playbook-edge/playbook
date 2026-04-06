@@ -86,7 +86,7 @@ def _clean(val):
 
 def log_ev_signals(signals_df: pd.DataFrame, run_date=None) -> int:
     """
-    Write all flagged EV signals (ev >= 4%) to the ev_signals table.
+    Write all flagged EV signals (ev >= 2%) to the ev_signals table.
     Called automatically after ev_calculator runs.
     Returns number of rows inserted, or 0 if Supabase is unavailable.
     """
@@ -105,31 +105,49 @@ def log_ev_signals(signals_df: pd.DataFrame, run_date=None) -> int:
     rows = []
     for _, r in flagged.iterrows():
         rows.append({
-            'run_date':         today,
-            'player':           _clean(r.get('player')),
-            'prop_type':        _clean(r.get('prop_type')),
-            'matchup':          _clean(r.get('matchup')),
-            'book':             _clean(r.get('book')),
-            'side':             _clean(r.get('side')),
-            'line':             _clean(r.get('line')),
-            'odds':             int(float(_clean(r.get('odds')))) if _clean(r.get('odds')) is not None else None,
-            'ev':               _clean(r.get('ev')),
-            'model_prob':       _clean(r.get('model_prob')),
-            'implied_prob':     _clean(r.get('implied_prob')),
-            'kelly_pct':        _clean(r.get('kelly_pct')),
-            'kelly_dollars':    _clean(r.get('kelly_dollars')),
-            'k9_used':          _clean(r.get('k9_used')),
-            'k9_current':       _clean(r.get('k9_current')),
-            'k9_historical':    _clean(r.get('k9_historical')),
-            'k9_trend':         _clean(r.get('k9_trend')),
-            'hist_reliability': int(float(_clean(r.get('hist_reliability')))) if _clean(r.get('hist_reliability')) is not None else None,
-            'ip_per_start':     _clean(r.get('ip_per_start')),
-            'xfip':             _clean(r.get('xfip')),
-            'opp_team':         _clean(r.get('opp_team')),
-            'opp_k_pct':        _clean(r.get('opp_k_pct')),
-            'matchup_factor':   _clean(r.get('matchup_factor')),
-            'expected_ks':      _clean(r.get('expected_ks')),
-            'flag':             True,
+            'run_date':              today,
+            'player':                _clean(r.get('player')),
+            'prop_type':             _clean(r.get('prop_type')),
+            'matchup':               _clean(r.get('matchup')),
+            'book':                  _clean(r.get('book')),
+            'side':                  _clean(r.get('side')),
+            'line':                  _clean(r.get('line')),
+            'odds':                  int(float(_clean(r.get('odds')))) if _clean(r.get('odds')) is not None else None,
+            'ev':                    _clean(r.get('ev')),
+            'model_prob':            _clean(r.get('model_prob')),
+            'implied_prob':          _clean(r.get('implied_prob')),
+            'kelly_pct':             _clean(r.get('kelly_pct')),
+            'kelly_dollars':         _clean(r.get('kelly_dollars')),
+            'k9_used':               _clean(r.get('k9_used')),
+            'k9_current':            _clean(r.get('k9_current')),
+            'k9_historical':         _clean(r.get('k9_historical')),
+            'k9_trend':              _clean(r.get('k9_trend')),
+            'hist_reliability':      int(float(_clean(r.get('hist_reliability')))) if _clean(r.get('hist_reliability')) is not None else None,
+            'ip_per_start':          _clean(r.get('ip_per_start')),
+            'xfip':                  _clean(r.get('xfip')),
+            'opp_team':              _clean(r.get('opp_team')),
+            'opp_k_pct':             _clean(r.get('opp_k_pct')),
+            'matchup_factor':        _clean(r.get('matchup_factor')),
+            'expected_ks':           _clean(r.get('expected_ks')),
+            'flag':                  True,
+            # Calibration columns
+            'velo_trend':            _clean(r.get('velo_trend')),
+            'velo_factor':           _clean(r.get('velo_factor')),
+            'spin_rate':             _clean(r.get('spin_rate')),
+            'pitch_mix':             _clean(r.get('pitch_mix')),
+            'throws':                _clean(r.get('throws')),
+            'prob_capped':           bool(_clean(r.get('prob_capped'))) if _clean(r.get('prob_capped')) is not None else False,
+            'low_line_note':         _clean(r.get('low_line_note')),
+            'umpire_name':           _clean(r.get('umpire_name')),
+            'umpire_adjustment':     _clean(r.get('umpire_adjustment')),
+            'kelly_cap_applied':     bool(_clean(r.get('kelly_cap_applied'))) if _clean(r.get('kelly_cap_applied')) is not None else False,
+            'low_history':           bool(_clean(r.get('low_history'))) if _clean(r.get('low_history')) is not None else False,
+            'ev_suspect':            bool(_clean(r.get('ev_suspect'))) if _clean(r.get('ev_suspect')) is not None else False,
+            # Weather columns
+            'weather_wind_label':    _clean(r.get('weather_wind_label')),
+            'weather_wind_factor':   _clean(r.get('weather_wind_factor')),
+            'weather_temp_f':        _clean(r.get('weather_temp_f')),
+            'weather_precip_pct':    int(_clean(r.get('weather_precip_pct'))) if _clean(r.get('weather_precip_pct')) is not None else None,
         })
 
     try:

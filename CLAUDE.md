@@ -59,6 +59,7 @@ Step 1    scrapers/baseball_savant.py   →  data/raw/savant_today.csv
 Step 2    scrapers/fangraphs.py         →  data/raw/pitcher_stats.csv
                                             data/raw/team_krates.csv
 Step 2.5  scrapers/umpire_scraper.py    →  Supabase: umpire_profiles (weekly refresh)
+Step 2.6  scrapers/weather_scraper.py   →  data/raw/weather_today.csv
 Step 3    scrapers/historical_stats.py  →  data/historical/pitcher_stats_2024.csv
                                             data/historical/pitcher_stats_2025.csv
                                             data/historical/pitcher_stats_all.csv
@@ -133,7 +134,25 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - **Low line discount**: lines ≤3.5 → model prob × 0.88; lines ≤2.5 → × 0.80; `low_line_note` column explains when applied
 - **Synthetic props fallback**: when no live props exist, generates lines from K/9 for testing
 - Flags any prop above 4% EV; saves full results to `ev_signals.csv`
-- ev_signals.csv new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `prob_capped`, `low_line_note`
+- **EV threshold**: 2% (changed from 4%) — generates more signals for paper trading validation
+- **ev_suspect flag**: signals where EV > 18% on live props are flagged as suspect — logged to Supabase but excluded from Discord alerts and paper trading. Prevents inflated early-season data from generating fake Degen signals.
+- **low_history flag**: pitchers with fewer than 8 total GS across 2024+2025 → 95% historical weight, 0.65 probability cap. Protects against injury returnees and callups with tiny historical samples.
+- **Forced Degen**: if no natural 20%+ EV signal exists, the top-ranked signal is force-badged as 🎰 Degen so every daily card has at least one headline pick
+- **Weather integration**: `build_ev_signals()` accepts `weather_df`; `_weather_cols()` helper maps home team to wind/temp/precip. Weather line appears in Discord embeds.
+- ev_signals.csv columns (41 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`
+
+### `scrapers/weather_scraper.py` — WORKING
+- **Open-Meteo API** (free, no key): hourly wind speed/direction, temperature, precipitation forecasts keyed on ballpark lat/lon
+- `STADIUM_COORDS`: 30 MLB stadiums with lat/lon, center-field direction (degrees), dome flag
+- `get_game_weather(home_team_code, game_datetime_utc)` — calls Open-Meteo for the closest hour to first pitch
+- `calculate_wind_adjustment(wind_speed_mph, wind_direction_deg, cf_direction_deg, is_dome)` — returns `(wind_factor, wind_label)`
+  - Wind blowing out 15+ mph: +0.25 factor; 10-15 mph out: +0.15
+  - Wind blowing in 10-15 mph: -0.15; 15+ mph in: -0.25
+  - Within 45 degrees of center-field axis = "out" or "in"; else neutral
+- `get_todays_weather(date_str=None)` — calls MLB Stats API schedule to get today's games + home teams, runs weather per game, saves `data/raw/weather_today.csv`
+- Columns saved: `home_team`, `wind_speed_mph`, `wind_direction_deg`, `wind_label`, `wind_factor`, `temperature_f`, `precip_pct`, `is_dome`
+- Pipeline step 2.6 — runs between umpires and historical stats
+- ev_calculator loads `weather_today.csv` and passes it to `build_ev_signals()` as `weather_df`; weather columns written to `ev_signals.csv` and Supabase
 
 ### `scrapers/umpire_scraper.py` — WORKING
 - **Part 1 — profiles (weekly)**: fetches umpire zone tendency data from `umpscorecards.com/api/umpires?season={year}`
@@ -180,7 +199,8 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 
 | File | Updated | Contents |
 |------|---------|----------|
-| `data/raw/savant_today.csv` | Daily | Today's starters: k_pct, velo, velo_trend, spin_rate, pitch_mix, babip |
+| `data/raw/savant_today.csv` | Daily | Today's starters: k_pct, velo, velo_trend, spin_rate, pitch_mix, babip, throws, avg_ip, hist_avg_ip |
+| `data/raw/weather_today.csv` | Daily | Game-day weather per home team: wind_label, wind_factor, temp_f, precip_pct |
 | `data/raw/pitcher_stats.csv` | Daily | Season leaderboard: k9, xfip, fip, babip |
 | `data/raw/team_krates.csv` | Daily | Team K% vs RHP and LHP |
 | `data/raw/todays_props.csv` | Daily | Live prop lines from books |
@@ -274,7 +294,9 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 | `player_baselines_cache` | 935-pitcher historical composites | Weekly |
 | `umpire_profiles` | Umpire zone tendency data from umpscorecards.com | Weekly |
 
-All tables confirmed live and accepting writes as of 2026-04-05.
+All tables confirmed live and accepting writes as of 2026-04-06.
+
+`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `database.py` writes all of these on every run.
 
 ## Roadmap
 
@@ -284,8 +306,8 @@ All tables confirmed live and accepting writes as of 2026-04-05.
 2. **Wire `send_heartbeat`** ✓ ALREADY DONE
    Called at the end of `auto_resolve` in both paths (bets resolved + no pending bets). Sends W/L record, pending count, game count to health channel. Lives in `discord_alerts.py:send_heartbeat()`.
 
-3. **Weather scraper** (`scrapers/weather_scraper.py`) — NOT YET BUILT
-   Fetch game-day weather conditions (wind speed/direction, temperature, dome/outdoor) for each ballpark. Outdoor stadiums with high wind-out conditions affect home run props; cold/wet weather depresses offense and can lead to more strikeouts. Would run as Step 2.6 in the pipeline (after umpires, before historical stats). Suggest using a free weather API (e.g. Open-Meteo — no key required) keyed on ballpark lat/lon coordinates.
+3. **Weather scraper** (`scrapers/weather_scraper.py`) — BUILT
+   Fetches game-day weather for each ballpark using Open-Meteo API (free, no key). Runs as Step 2.6 in pipeline (after umpires, before historical). Saves `data/raw/weather_today.csv`. Wind factor baked into ev_signals and Discord embeds. See full details in `scrapers/weather_scraper.py` section below.
 
 4. **Pitcher hand-off / innings cap detection**
    If a pitcher's season IP is suspiciously low for their start count, flag as potential innings cap and discount expected IP further. Protects against overvaluing K props on limited young arms (Skenes, post-injury returns).
