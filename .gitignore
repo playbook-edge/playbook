@@ -23,6 +23,10 @@ data/historical/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/historical/.gitkeep
+# Historical season stats are static (seasons are over) — commit them so Railway never re-fetches
+!data/historical/pitcher_stats_2024.csv
+!data/historical/pitcher_stats_2025.csv
+!data/historical/pitcher_stats_all.csv
 
 # OS files
 .DS_Store
