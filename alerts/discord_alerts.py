@@ -175,11 +175,21 @@ def calculate_playbook_iq(signal: dict) -> int:
     return calculate_playbook_iq_components(signal)['playbookiq']
 
 
-def iq_bar(score: int) -> str:
-    """Visual bar for the IQ score. e.g.  ████████░░  82"""
-    filled = round(score / 10)
-    empty  = 10 - filled
-    return '█' * filled + '░' * empty + f'  {score}/100'
+def playbookiq_stars(score: int) -> tuple:
+    """
+    Convert a PlaybookIQ score (0-100) to a star rating.
+    Returns (star_string, label).
+      90-100 → ⭐⭐⭐⭐⭐  Elite
+      75-89  → ⭐⭐⭐⭐    Strong
+      60-74  → ⭐⭐⭐      Good
+      45-59  → ⭐⭐        Fair
+      0-44   → ⭐          Weak
+    """
+    if score >= 90:   return '\u2b50\u2b50\u2b50\u2b50\u2b50', 'Elite'
+    elif score >= 75: return '\u2b50\u2b50\u2b50\u2b50',        'Strong'
+    elif score >= 60: return '\u2b50\u2b50\u2b50',              'Good'
+    elif score >= 45: return '\u2b50\u2b50',                    'Fair'
+    else:             return '\u2b50',                          'Weak'
 
 
 # ─────────────────────────────────────────────
@@ -443,9 +453,10 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
         f'{tier_emoji}  {signal["player"]}  —  {prop_label}  {odds_display}'
     )
 
+    stars, star_label = playbookiq_stars(iq_score)
     embed.set_description(
         f'```\n'
-        f'PlaybookIQ   {iq_bar(iq_score)}\n'
+        f'PlaybookIQ   {stars}  {iq_score}  {star_label}\n'
         f'```'
     )
 
@@ -962,11 +973,9 @@ def send_daily_card(signals_df: pd.DataFrame,
             tier_emoji = '\U0001f3b0'   # 🎰
             color      = 0x9B59B6       # purple — same as natural Degen
 
-        # IQ bar — ▓░ for Discord, ##.. for terminal
-        iq_score       = calculate_playbook_iq(signal)
-        filled         = round(iq_score / 10)
-        iq_bar_discord = '\u2593' * filled + '\u2591' * (10 - filled)
-        iq_bar_term    = '#' * filled + '.' * (10 - filled)
+        # IQ stars
+        iq_score              = calculate_playbook_iq(signal)
+        iq_stars, iq_label    = playbookiq_stars(iq_score)
 
         # Velo trend
         velo_trend = signal.get('velo_trend')
@@ -1009,8 +1018,7 @@ def send_daily_card(signals_df: pd.DataFrame,
             f'**{bet_title}**',
             subline,
             '',
-            f'PlaybookIQ: **{iq_score}/100**  {iq_bar_discord}',
-            f'{trend_emoji}  {trend_label}',
+            f'{iq_stars}  **{iq_score}**  {iq_label}   {trend_emoji}  {trend_label}',
         ]
         if krate_sentence:
             desc_lines.append(krate_sentence)
@@ -1054,7 +1062,7 @@ def send_daily_card(signals_df: pd.DataFrame,
         print(f'\n  Tier    : {tier_label}')
         print(f'  Bet     : {signal["player"]} -- {prop_label}')
         print(f'  Subline : {book_str} | {odds_display} | {game_time}')
-        print(f'  IQ      : {iq_score}/100  [{iq_bar_term}]')
+        print(f'  IQ      : {iq_stars}  {iq_score}  {iq_label}')
         print(f'  Trend   : {trend_label}')
         if krate_sentence:
             print(f'  K-rate  : {krate_sentence}')
