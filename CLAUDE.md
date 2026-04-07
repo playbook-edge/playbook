@@ -37,6 +37,8 @@ playbook/
 ├── models/               # EV calculator and player baseline builder
 ├── scrapers/             # Data-pulling scripts
 ├── alerts/               # Discord notification logic
+├── scripts/              # One-time / manual utility scripts (never scheduled)
+│   └── reset_paper_trading.py  # Wipes all bet history for a clean-slate restart
 ├── logs/                 # Daily pipeline logs (pipeline_YYYY-MM-DD.log)
 ├── research/             # Notes, experiments, one-off analysis
 ├── config.py             # All settings loaded from .env
@@ -46,6 +48,14 @@ playbook/
 ├── .env.example          # Template — copy to .env and fill in keys
 └── .gitignore            # Keeps .env and data files off GitHub
 ```
+
+### `scripts/reset_paper_trading.py` — MANUAL ONLY
+- Wipes all paper trading history so the system can restart with a fresh $1,000 bankroll
+- Clears: `paper_trades`, `ev_signals`, `closing_lines`, `pipeline_runs`, `readiness_history`, `line_movement` in Supabase
+- Deletes local: `data/processed/paper_trades.csv`, `data/processed/ev_signals.csv`
+- Preserves: `team_krates_cache`, `player_baselines_cache`, `umpire_profiles`, `statcast_pull_log`
+- Requires typing `YES` at a safety prompt before anything is deleted
+- **Never schedule or add to main.py** — run once manually before a season restart
 
 ---
 
@@ -142,7 +152,9 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - **low_history flag**: pitchers with fewer than 8 total GS across 2024+2025 → 95% historical weight, 0.65 probability cap. Protects against injury returnees and callups with tiny historical samples.
 - **Forced Degen**: if no natural 20%+ EV signal exists, the top-ranked signal is force-badged as 🎰 Degen so every daily card has at least one headline pick
 - **Weather integration**: `build_ev_signals()` accepts `weather_df`; `_weather_cols()` helper maps home team to wind/temp/precip. Weather line appears in Discord embeds.
-- ev_signals.csv columns (42 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`, `duplicate`
+- **Innings cap detection**: if a pitcher has 3+ FanGraphs-verified starts and their blended IP/start is >1.0 inning below their historical baseline, `innings_capped = True` is set and `ip_per_start` is reduced by another 0.5 innings. Protects against overvaluing K props on managed/limited arms. When triggered, Claude narrative also receives a note: "pitcher appears to be on an innings limit."
+- **Team K-rate PA threshold**: after `lookup_opp_krate()`, checks `pa_vs_rhp` or `pa_vs_lhp` for the opposing team. If <150 PA, blends the current K-rate 30% current / 70% league average (22.5%) to dampen early-season sample noise. Stored in `matchup_pa_count`.
+- ev_signals.csv columns (44 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`, `duplicate`, `innings_capped`, `matchup_pa_count`
 
 ### `scrapers/weather_scraper.py` — WORKING
 - **Open-Meteo API** (free, no key): hourly wind speed/direction, temperature, precipitation forecasts keyed on ballpark lat/lon
@@ -299,17 +311,20 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 | `player_baselines_cache` | 935-pitcher historical composites | Weekly |
 | `umpire_profiles` | Umpire zone tendency data from umpscorecards.com | Weekly |
 | `line_movement` | Opening vs 6:30 PM snapshot odds comparison for each active paper trade | Per snapshot run |
+| `readiness_history` | Weekly snapshot of verdict, CLV, ROI, win rate, bankroll, checklist score | Weekly (Sundays) |
 
 All tables confirmed live and accepting writes as of 2026-04-07.
 
-`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `database.py` writes all of these on every run. `duplicate` column added 2026-04-06 (no schema migration needed — written by ev_calculator).
+`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `duplicate` column added 2026-04-06. `innings_capped` (BOOLEAN) and `matchup_pa_count` (INTEGER) columns added 2026-04-07.
 
 `pipeline_runs` notes field now includes `odds_api_quota:N` appended by `log_pipeline_run()` — written by `main.py` reading `data/raw/odds_api_quota.txt` after the odds scraper step. No schema migration needed.
+
+`readiness_history` columns: `date`, `verdict`, `avg_clv_overall`, `avg_clv_conservative`, `roi_pct`, `total_bets`, `win_rate`, `bankroll_current`, `checklist_complete_count` (0–4 score counting GO conditions met). Written by `save_readiness_snapshot()` in `readiness_dashboard.py` on every run. Read back to render the 4-week trend section in the Discord embed.
 
 ## Roadmap
 
 1. **Real-money readiness dashboard** ✓ BUILT
-   `alerts/readiness_dashboard.py` — weekly Discord embed to health channel. Shows verdict (GO/MONITOR/NOT YET/HOLD), avg CLV by tier, win rate vs break-even, ROI, bankroll. Railway service `playbook-readiness`, cron `0 13 * * 0` (9am ET Sundays). Run manually: `python alerts/readiness_dashboard.py` or `... preview` for terminal-only.
+   `alerts/readiness_dashboard.py` — weekly Discord embed to health channel. Shows verdict (GO/MONITOR/NOT YET/HOLD), avg CLV by tier, win rate vs break-even, ROI, bankroll, and a **4-week trend table** (date / verdict / CLV / ROI / checklist score). Every run writes a row to `readiness_history` in Supabase so the trend accumulates over the season. Railway service `playbook-readiness`, cron `0 13 * * 0` (9am ET Sundays). Run manually: `python alerts/readiness_dashboard.py` or `... preview` for terminal-only.
 
 2. **Wire `send_heartbeat`** ✓ ALREADY DONE
    Called at the end of `auto_resolve` in both paths (bets resolved + no pending bets). Sends W/L record, pending count, game count to health channel. Lives in `discord_alerts.py:send_heartbeat()`.
@@ -317,8 +332,8 @@ All tables confirmed live and accepting writes as of 2026-04-07.
 3. **Weather scraper** (`scrapers/weather_scraper.py`) — BUILT
    Fetches game-day weather for each ballpark using Open-Meteo API (free, no key). Runs as Step 2.6 in pipeline (after umpires, before historical). Saves `data/raw/weather_today.csv`. Wind factor baked into ev_signals and Discord embeds. See full details in `scrapers/weather_scraper.py` section below.
 
-4. **Pitcher hand-off / innings cap detection**
-   If a pitcher's season IP is suspiciously low for their start count, flag as potential innings cap and discount expected IP further. Protects against overvaluing K props on limited young arms (Skenes, post-injury returns).
+4. **Pitcher hand-off / innings cap detection** ✓ BUILT
+   `innings_capped` flag in ev_calculator.py: fires when pitcher has 3+ FanGraphs-verified starts and blended IP/start is >1.0 inning below historical baseline. Reduces ip_per_start by 0.5 more and injects a note into the Claude narrative. `matchup_pa_count` also added: blends team K-rate toward league average (22.5%) when opposing team has <150 PA vs the pitcher's handedness.
 
 5. **Line movement tracking** ✓ BUILT
    `scrapers/odds_api.py snapshot` → `alerts/paper_trading.py capture_line_movement()`. Railway service `playbook-snapshot`, cron `30 22 * * *` (6:30 PM ET). Saves `data/raw/props_gameday_snapshot.csv` and writes to Supabase `line_movement` table. `movement_direction` is `toward` (market agrees), `against` (market disagrees), or `flat`. Run manually: `python scrapers/odds_api.py snapshot`.
