@@ -104,6 +104,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - Current season pitching leaderboard: xFIP, FIP, K/9, BB/9, BABIP
 - Batting team derived from `home_team`/`away_team` + `inning_topbot` (no direct column)
 - **Supabase caching**: team K-rates cached daily — skips full Statcast pull if already fetched today (saves 2-5 min on Railway)
+- **FanGraphs 403 handling** (added 2026-04-07): FanGraphs blocks server IPs (Railway) on `leaders-legacy.aspx`. `build_pitcher_leaderboard()` now has three-layer fallback: (1) same-day file cache — if `pitcher_stats.csv` was written today, skip the fetch entirely; (2) pybaseball fetch with WARNING on failure instead of crash; (3) use previous day's CSV if fetch fails. Step logs `Done` instead of `FAIL`. ev_calculator's hist_xfip fallback handles any missing xFIP data downstream.
 
 ### `scrapers/historical_stats.py` — WORKING
 - Pulls full 2024 and 2025 FanGraphs season stats via `pitching_stats(year, year, qual=0)`

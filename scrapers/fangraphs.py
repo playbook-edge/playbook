@@ -271,21 +271,12 @@ def build_team_krates():
 # Part 2: Current season pitching leaderboard
 # ---------------------------------------------------------------------------
 
-def build_pitcher_leaderboard():
-    print(f"\nFetching {CURRENT_YEAR} season pitching leaderboard from FanGraphs...")
-    time.sleep(DELAY)
-
-    # qual=0 includes all pitchers; we'll filter to starters with enough IP
-    df = pitching_stats(CURRENT_YEAR, CURRENT_YEAR, qual=0)
-
-    # Keep only starting pitchers with at least 5 IP
-    # 'Start-IP' = innings as a starter; 'G' = games, 'GS' = games started
+def _parse_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter and rename a raw pitching stats DataFrame into leaderboard format."""
     starters = df[
-        (df.get('GS', df.get('G', 0)) > 0) &
+        (df.get('GS', df.get('G', pd.Series(dtype=float))) > 0) &
         (df['IP'] >= 5)
     ].copy()
-
-    # Select and rename columns cleanly
     cols = {
         'Name':  'name',
         'Team':  'team',
@@ -300,9 +291,43 @@ def build_pitcher_leaderboard():
     }
     available = {k: v for k, v in cols.items() if k in starters.columns}
     leaderboard = starters[list(available.keys())].rename(columns=available)
-    leaderboard = leaderboard.sort_values('xfip').reset_index(drop=True)
+    return leaderboard.sort_values('xfip').reset_index(drop=True)
 
-    return leaderboard
+
+def build_pitcher_leaderboard():
+    print(f"\nFetching {CURRENT_YEAR} season pitching leaderboard from FanGraphs...")
+
+    # ── Same-day cache: if pitcher_stats.csv was written today, skip the fetch ──
+    if os.path.exists(PITCHER_STATS):
+        mtime = datetime.fromtimestamp(os.path.getmtime(PITCHER_STATS)).strftime('%Y-%m-%d')
+        if mtime == TODAY:
+            cached = pd.read_csv(PITCHER_STATS)
+            print(f'  Using cached pitcher_stats.csv from today ({len(cached)} pitchers) [0s]')
+            return cached
+
+    # ── Try pybaseball → FanGraphs ───────────────────────────────────────────
+    # FanGraphs blocks server IPs (Railway, etc.) with 403.  We attempt the
+    # fetch and fall back to yesterday's file rather than crashing the pipeline.
+    time.sleep(DELAY)
+    try:
+        raw = pitching_stats(CURRENT_YEAR, CURRENT_YEAR, qual=0)
+        leaderboard = _parse_leaderboard(raw)
+        print(f'  FanGraphs fetch successful ({len(leaderboard)} starters)')
+        return leaderboard
+    except Exception as e:
+        print(f'  WARNING: FanGraphs fetch failed ({e})')
+
+    # ── Fallback: use yesterday's cached file ────────────────────────────────
+    # Pitcher K/9 and xFIP change very slowly; one stale day is fine.
+    # ev_calculator already falls back to hist_xfip when xFIP is None, so
+    # even a fully missing leaderboard degrades gracefully.
+    if os.path.exists(PITCHER_STATS):
+        cached = pd.read_csv(PITCHER_STATS)
+        print(f'  Using previous pitcher_stats.csv ({len(cached)} pitchers) — xFIP fallback active')
+        return cached
+
+    print('  No pitcher leaderboard available — ev_calculator will use hist_xfip fallback')
+    return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -333,8 +358,11 @@ def run():
 
     # --- Part 2: Pitcher Leaderboard ---
     leaderboard = build_pitcher_leaderboard()
-    leaderboard.to_csv(PITCHER_STATS, index=False)
-    print(f"\nSaved to: {os.path.normpath(PITCHER_STATS)}")
+    if not leaderboard.empty:
+        leaderboard.to_csv(PITCHER_STATS, index=False)
+        print(f"\nSaved to: {os.path.normpath(PITCHER_STATS)}")
+    else:
+        print(f"\nWARNING: Skipping pitcher_stats.csv write — no data returned (preserving any existing cache)")
 
     print(f"\n--- Pitching Leaderboard: Best xFIP (top 15) ---")
     print(f"{'Name':<22} {'Team':<5} {'IP':>5} {'GS':>4} {'ERA':>5} {'FIP':>5} {'xFIP':>5} {'K/9':>5} {'BB/9':>5} {'BABIP':>6}")
