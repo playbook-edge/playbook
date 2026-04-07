@@ -1037,10 +1037,92 @@ def capture_line_movement() -> list:
         flat    = sum(1 for r in results if r['movement_direction'] == 'flat')
         print(f'\n  Summary: {toward} toward / {against} against / {flat} flat')
         print(f'  Logged {len(results)} line movement record(s) to Supabase.')
+        _send_line_movement_alert(results, toward, against, flat)
     else:
         print('\n  No matching pitchers found in snapshot.')
 
     return results
+
+
+def _send_line_movement_alert(results: list, toward: int, against: int, flat: int):
+    """
+    Send a line movement summary embed to the health channel.
+    One row per bet, color-coded by overall direction.
+    Bets where the market moved >5% against us are flagged with a warning.
+    """
+    from discord_webhook import DiscordWebhook, DiscordEmbed
+
+    url = DISCORD_WEBHOOK_HEALTH
+    if not url:
+        print('  DISCORD_WEBHOOK_HEALTH not set — skipping line movement alert')
+        return
+
+    # Embed color: green if majority toward, red if majority against, gold if mixed
+    if toward > against:
+        color = 0x2ECC71   # green
+    elif against > toward:
+        color = 0xE74C3C   # red
+    else:
+        color = 0xF1C40F   # gold
+
+    hook  = DiscordWebhook(url=url, rate_limit_retry=True)
+    embed = DiscordEmbed(
+        title=f'📊  Line Movement — 6:30 PM Snapshot',
+        color=color,
+    )
+
+    # One field per bet
+    for r in results:
+        player    = r['player']
+        side      = r['side']
+        line      = float(r['line'])
+        o_odds    = int(r['opening_odds'])
+        s_odds    = int(r['snapshot_odds'])
+        movement  = float(r['movement_pct'])
+        direction = r['movement_direction']
+
+        if direction == 'toward':
+            emoji = '✅'
+        elif direction == 'against':
+            emoji = '⚠️' if abs(movement) >= 0.05 else '🔶'
+        else:
+            emoji = '➡️'
+
+        prop_label = f'{side} {line:.1f}'
+        odds_line  = f'{o_odds:+d} → {s_odds:+d}  ({movement:+.1%})'
+
+        embed.add_embed_field(
+            name=f'{emoji}  {player}  —  {prop_label}',
+            value=odds_line,
+            inline=False,
+        )
+
+    # Summary footer field
+    summary = f'✅ {toward} toward  ·  🔶 {against} against  ·  ➡️ {flat} flat'
+    embed.add_embed_field(name='Summary', value=summary, inline=False)
+
+    # Extra warning if any bet moved >5% against
+    big_against = [r for r in results
+                   if r['movement_direction'] == 'against'
+                   and abs(float(r['movement_pct'])) >= 0.05]
+    if big_against:
+        names = ', '.join(r['player'].split()[-1] for r in big_against)
+        embed.add_embed_field(
+            name='⚠️  Large move against position',
+            value=f'{names} — market moved 5%+ against our bet. Consider flagging for review.',
+            inline=False,
+        )
+
+    embed.set_footer(text=f'Playbook Health  •  {datetime.now().strftime("%b %d, %Y  %I:%M %p")}')
+    embed.set_timestamp()
+    hook.add_embed(embed)
+
+    try:
+        resp = hook.execute()
+        ok   = hasattr(resp, 'status_code') and resp.status_code in (200, 204)
+        print(f'  Line movement alert {"sent" if ok else "failed"} to health channel.')
+    except Exception as e:
+        print(f'  Line movement alert error: {e}')
 
 
 def resolve_pending():
