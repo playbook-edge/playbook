@@ -17,15 +17,16 @@ import os
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import ODDS_API_KEY
 
-RAW_DIR     = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
-OUTPUT_PATH = os.path.join(RAW_DIR, 'todays_props.csv')
-QUOTA_PATH  = os.path.join(RAW_DIR, 'odds_api_quota.txt')   # persists quota for pipeline log
+RAW_DIR       = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
+OUTPUT_PATH   = os.path.join(RAW_DIR, 'todays_props.csv')
+SNAPSHOT_PATH = os.path.join(RAW_DIR, 'props_gameday_snapshot.csv')
+QUOTA_PATH    = os.path.join(RAW_DIR, 'odds_api_quota.txt')   # persists quota for pipeline log
 
 BASE_URL    = 'https://api.the-odds-api.com/v4'
 SPORT       = 'baseball_mlb'
@@ -174,6 +175,97 @@ def get_event_props(event_id, home_team, away_team):
 
 
 # ---------------------------------------------------------------------------
+# Game-day snapshot — run at ~6:30 PM ET via playbook-snapshot Railway service
+# ---------------------------------------------------------------------------
+
+def get_closing_snapshot() -> pd.DataFrame | None:
+    """
+    Fetch current prop lines for all games with first pitch within the next 3 hours.
+    Designed to run at 6:30 PM ET — catches most evening games before they start.
+
+    Saves to data/raw/props_gameday_snapshot.csv with the same column structure
+    as todays_props.csv plus a snapshot_time column (UTC ISO string).
+
+    Returns the snapshot DataFrame, or None if no qualifying games were found.
+    """
+    print('=' * 55)
+    print('  PLAYBOOK -- Game-Day Odds Snapshot')
+    print('=' * 55)
+
+    if not ODDS_API_KEY or ODDS_API_KEY == 'your_odds_api_key_here':
+        print('\nERROR: ODDS_API_KEY is not set.')
+        return None
+
+    os.makedirs(RAW_DIR, exist_ok=True)
+
+    now_utc       = datetime.now(timezone.utc)
+    cutoff_utc    = now_utc + timedelta(hours=3)
+    snapshot_time = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    print(f'\nSnapshot time (UTC): {snapshot_time}')
+    print(f'Capturing games starting before: {cutoff_utc.strftime("%H:%M UTC")}')
+
+    # Fetch all of today's events then filter to the 3-hour window
+    events, quota_remaining = get_todays_events()
+
+    upcoming = []
+    for e in events:
+        ct = e.get('commence_time', '')
+        try:
+            game_utc = datetime.fromisoformat(ct.replace('Z', '+00:00'))
+            if now_utc <= game_utc <= cutoff_utc:
+                upcoming.append(e)
+        except Exception:
+            pass
+
+    print(f'  {len(upcoming)} game(s) with first pitch in the next 3 hours')
+
+    if not upcoming:
+        print('  No qualifying games in window — snapshot not saved.')
+        return None
+
+    all_rows = []
+    for i, event in enumerate(upcoming, 1):
+        home = event.get('home_team', '')
+        away = event.get('away_team', '')
+        eid  = event['id']
+        ct   = event.get('commence_time', '')[:16]
+        print(f'  [{i}/{len(upcoming)}] {away} @ {home}  (first pitch ~{ct} UTC)')
+
+        rows, evt_quota = get_event_props(eid, home, away)
+        if evt_quota is not None:
+            quota_remaining = evt_quota
+        all_rows.extend(rows)
+        time.sleep(DELAY)
+
+    # Persist final quota count
+    if quota_remaining is not None:
+        try:
+            with open(QUOTA_PATH, 'w') as _qf:
+                _qf.write(str(quota_remaining))
+        except Exception:
+            pass
+
+    if not all_rows:
+        print('\n  No props found for upcoming games.')
+        return None
+
+    df = pd.DataFrame(all_rows)
+    df = df[['player', 'matchup', 'prop_type', 'line', 'over_odds', 'under_odds', 'book']]
+    df['snapshot_time'] = snapshot_time
+    df = df.sort_values(['player', 'book']).reset_index(drop=True)
+
+    df.to_csv(SNAPSHOT_PATH, index=False)
+
+    print(f'\n  Snapshot saved: {len(df)} prop line(s) for {df["player"].nunique()} pitcher(s)')
+    print(f'  File: {os.path.normpath(SNAPSHOT_PATH)}')
+    if quota_remaining is not None:
+        print(f'  API quota remaining: {quota_remaining}')
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -282,4 +374,13 @@ def run():
 
 
 if __name__ == '__main__':
-    run()
+    if len(sys.argv) > 1 and sys.argv[1] == 'snapshot':
+        # 6:30 PM snapshot — save game-day lines, then compute line movement
+        get_closing_snapshot()
+        try:
+            from alerts.paper_trading import capture_line_movement
+            capture_line_movement()
+        except Exception as _e:
+            print(f'\nLine movement error: {_e}')
+    else:
+        run()

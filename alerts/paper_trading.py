@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import DISCORD_WEBHOOK_PAPER, DISCORD_WEBHOOK_HEALTH, BANKROLL, ODDS_API_KEY
 
 TRADES_PATH       = os.path.join(os.path.dirname(__file__), '..', 'data', 'processed', 'paper_trades.csv')
+OPENING_PROPS     = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw', 'todays_props.csv')
+SNAPSHOT_PROPS    = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw', 'props_gameday_snapshot.csv')
 STARTING_BANKROLL = float(BANKROLL) if BANKROLL else 1000.0
 
 TRADE_COLUMNS = [
@@ -920,6 +922,127 @@ def _fetch_closing_odds(date_str: str) -> dict:
     return closing
 
 
+def capture_line_movement() -> list:
+    """
+    Compare morning opening odds (from paper trade) against the 6:30 PM snapshot
+    (props_gameday_snapshot.csv) for each active PENDING trade.
+
+    movement_pct = snapshot_implied_prob - opening_implied_prob
+      Positive → market moved toward our bet (confirms our edge)
+      Negative → market moved against us (market disagrees)
+      Zero     → line held flat all day
+
+    Results are written to the line_movement Supabase table.
+    Returns a list of movement record dicts (also printed to terminal).
+    """
+    print('=' * 55)
+    print('  PLAYBOOK -- Line Movement Capture')
+    print('=' * 55)
+
+    if not os.path.exists(SNAPSHOT_PROPS):
+        print(f'\n  No snapshot file found: {os.path.normpath(SNAPSHOT_PROPS)}')
+        print('  Run: python scrapers/odds_api.py snapshot')
+        return []
+
+    snapshot_df = pd.read_csv(SNAPSHOT_PROPS)
+
+    # Load active PENDING trades — Supabase first, CSV fallback
+    pending_rows = []
+    try:
+        from database import get_pending_trades
+        pending_rows = get_pending_trades()
+    except Exception as e:
+        print(f'  Supabase unavailable ({e}) — loading from CSV')
+
+    if not pending_rows:
+        df = _load_trades()
+        pending_rows = df[df['result'] == 'PENDING'].to_dict('records')
+
+    if not pending_rows:
+        print('\n  No pending trades to check.')
+        return []
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    print(f'\n  {len(pending_rows)} pending trade(s) — snapshot has {snapshot_df["player"].nunique()} pitcher(s)\n')
+
+    results = []
+
+    for trade in pending_rows:
+        player        = str(trade.get('player', ''))
+        side          = str(trade.get('side', ''))
+        line          = float(trade.get('line', 0))
+        prop_type     = str(trade.get('prop_type', 'pitcher_strikeouts'))
+        opening_odds  = float(trade.get('odds', 0))
+
+        odds_col = 'over_odds' if side == 'Over' else 'under_odds'
+
+        # Match player in snapshot (case-insensitive, strip whitespace)
+        snap_match = snapshot_df[
+            snapshot_df['player'].str.strip().str.lower() == player.strip().lower()
+        ]
+
+        if snap_match.empty:
+            print(f'  SKIP  {player:<30} — not in snapshot (game may not be in 3-hour window)')
+            continue
+
+        snap_odds_val = snap_match.iloc[0].get(odds_col)
+        if snap_odds_val is None or pd.isna(snap_odds_val):
+            print(f'  SKIP  {player:<30} — snapshot missing {odds_col}')
+            continue
+
+        snap_odds      = float(snap_odds_val)
+        opening_impl   = round(_american_to_implied_prob(opening_odds), 4)
+        snapshot_impl  = round(_american_to_implied_prob(snap_odds), 4)
+        movement       = round(snapshot_impl - opening_impl, 4)
+
+        if movement > 0.005:
+            direction = 'toward'      # market moved to agree with us
+        elif movement < -0.005:
+            direction = 'against'     # market moved against our position
+        else:
+            direction = 'flat'
+
+        arrow = '+' if direction == 'toward' else ('-' if direction == 'against' else '=')
+        print(
+            f'  {arrow}  {player:<30} {side:<5} {line:.1f}  '
+            f'open {int(opening_odds):+d} ({opening_impl:.1%}) -> '
+            f'snap {int(snap_odds):+d} ({snapshot_impl:.1%})  '
+            f'[{movement:+.1%} {direction}]'
+        )
+
+        record = {
+            'date':               today_str,
+            'player':             player,
+            'prop_type':          prop_type,
+            'side':               side,
+            'line':               line,
+            'opening_odds':       int(opening_odds),
+            'snapshot_odds':      int(snap_odds),
+            'opening_implied':    opening_impl,
+            'snapshot_implied':   snapshot_impl,
+            'movement_pct':       movement,
+            'movement_direction': direction,
+        }
+        results.append(record)
+
+        try:
+            from database import log_line_movement
+            log_line_movement(record)
+        except Exception as e:
+            print(f'    Supabase line_movement error: {e}')
+
+    if results:
+        toward  = sum(1 for r in results if r['movement_direction'] == 'toward')
+        against = sum(1 for r in results if r['movement_direction'] == 'against')
+        flat    = sum(1 for r in results if r['movement_direction'] == 'flat')
+        print(f'\n  Summary: {toward} toward / {against} against / {flat} flat')
+        print(f'  Logged {len(results)} line movement record(s) to Supabase.')
+    else:
+        print('\n  No matching pitchers found in snapshot.')
+
+    return results
+
+
 def resolve_pending():
     """
     Walk through every PENDING bet and let you mark each one WIN or LOSS.
@@ -1025,5 +1148,7 @@ if __name__ == '__main__':
         resolve_pending()
     elif len(sys.argv) > 1 and sys.argv[1] == 'auto_resolve':
         auto_resolve()
+    elif len(sys.argv) > 1 and sys.argv[1] == 'line_movement':
+        capture_line_movement()
     else:
         run()

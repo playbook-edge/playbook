@@ -370,6 +370,44 @@ def log_closing_line(record: dict):
 
 
 # ─────────────────────────────────────────────
+# line_movement
+# ─────────────────────────────────────────────
+
+def log_line_movement(record: dict):
+    """
+    Insert one line movement record into the line_movement table.
+    Called by capture_line_movement() in paper_trading.py at the 6:30 PM snapshot.
+
+    Columns: date, player, prop_type, side, line,
+             opening_odds, snapshot_odds,
+             opening_implied, snapshot_implied,
+             movement_pct, movement_direction
+    """
+    client = get_client()
+    if client is None:
+        return
+
+    row = {
+        'date':               _clean(record.get('date')),
+        'player':             _clean(record.get('player')),
+        'prop_type':          _clean(record.get('prop_type')),
+        'side':               _clean(record.get('side')),
+        'line':               _clean(record.get('line')),
+        'opening_odds':       int(record['opening_odds'])   if record.get('opening_odds')  is not None else None,
+        'snapshot_odds':      int(record['snapshot_odds'])  if record.get('snapshot_odds') is not None else None,
+        'opening_implied':    _clean(record.get('opening_implied')),
+        'snapshot_implied':   _clean(record.get('snapshot_implied')),
+        'movement_pct':       _clean(record.get('movement_pct')),
+        'movement_direction': _clean(record.get('movement_direction')),
+    }
+
+    try:
+        client.table('line_movement').insert(row).execute()
+    except Exception as e:
+        print(f'  Supabase line_movement insert error: {e}')
+
+
+# ─────────────────────────────────────────────
 # pipeline_runs
 # ─────────────────────────────────────────────
 
