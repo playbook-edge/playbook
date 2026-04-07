@@ -778,6 +778,20 @@ def build_ev_signals(props_df:    pd.DataFrame,
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values('ev', ascending=False).reset_index(drop=True)
+
+        # ── Compute PlaybookIQ components for each row ───────────────────────
+        # Stores 6 columns in ev_signals.csv: iq_reliability, iq_alignment,
+        # iq_market, iq_tier, iq_clarity, playbookiq.
+        # Discord reads pre-computed values so ranking is stable and auditable.
+        try:
+            from alerts.discord_alerts import calculate_playbook_iq_components
+            iq_rows = df.apply(lambda r: calculate_playbook_iq_components(r.to_dict()), axis=1)
+            iq_df   = pd.DataFrame(list(iq_rows))
+            for col in ['iq_reliability', 'iq_alignment', 'iq_market', 'iq_tier', 'iq_clarity', 'playbookiq']:
+                df[col] = iq_df[col].values
+        except Exception as e:
+            print(f'  PlaybookIQ components skipped: {e}')
+
     return df
 
 

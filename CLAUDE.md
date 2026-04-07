@@ -155,7 +155,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - **Weather integration**: `build_ev_signals()` accepts `weather_df`; `_weather_cols()` helper maps home team to wind/temp/precip. Weather line appears in Discord embeds.
 - **Innings cap detection**: if a pitcher has 3+ FanGraphs-verified starts and their blended IP/start is >1.0 inning below their historical baseline, `innings_capped = True` is set and `ip_per_start` is reduced by another 0.5 innings. Protects against overvaluing K props on managed/limited arms. When triggered, Claude narrative also receives a note: "pitcher appears to be on an innings limit."
 - **Team K-rate PA threshold**: after `lookup_opp_krate()`, checks `pa_vs_rhp` or `pa_vs_lhp` for the opposing team. If <150 PA, blends the current K-rate 30% current / 70% league average (22.5%) to dampen early-season sample noise. Stored in `matchup_pa_count`.
-- ev_signals.csv columns (44 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`, `duplicate`, `innings_capped`, `matchup_pa_count`
+- ev_signals.csv columns (50 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`, `duplicate`, `innings_capped`, `matchup_pa_count` + `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq`
 
 ### `scrapers/weather_scraper.py` — WORKING
 - **Open-Meteo API** (free, no key): hourly wind speed/direction, temperature, precipitation forecasts keyed on ballpark lat/lon
@@ -200,7 +200,16 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
   - Claude narrative: 2-3 sentences, casual tone, written for a casual bettor — uses pitcher name, K/9, xFIP, velo trend, opponent context
   - `dry_run=True` prints terminal preview without sending
 - **Tier badges by EV**: Conservative 4-7% (🟢), Moderate 7-12% (🟡), Aggressive 12-20% (🔴), Degen 20%+ (🎰)
-- **PlaybookIQ score (0-100)**: composite of EV (40pts) + edge (30pts) + xFIP quality (20pts) + sample size (10pts). EV component uses a stepped curve: 0pts at 4%, 20pts at 6%, 30pts at 9%, 40pts at 12%+ (hard cap). Prevents inflated EV on suspect/synthetic signals from distorting alert ordering — real 8-12% live-prop edges score proportionally higher than before.
+- **PlaybookIQ score (0-100)**: redesigned 2026-04-07 to measure confidence and trustworthiness, not model-vs-book disagreement. Five components:
+  - **Data Reliability (25 pts)**: pitcher's `hist_reliability` score (80+→25, 60-79→18, 40-59→10, <40→4). Capped at 8 if `low_history=True`.
+  - **Signal Alignment (25 pts)**: counts how many contextual factors support the bet direction — velo trend aligned (+6), umpire adjustment aligned (+6), team K-rate matchup aligned (+6), xFIP quality <3.20→+4 / 3.20-3.80→+2, K prop wind neutral (+3). Max 25.
+  - **Market Reasonableness (25 pts)**: edge 2-5%→25, 5-8%→20, 8-12%→12, 12-18%→5, 18%+→0. `ev_suspect=True`→0 always.
+  - **Tier Confidence (15 pts)**: Conservative→15, Moderate→10, Aggressive→4, Degen→0.
+  - **Bet Type Clarity (10 pts)**: Over with K/9>9.0 and line>5.5→10; Under with K/9<7.5 and line<5.5→10; within 1.5 Ks of expected total→7; low line (≤3.5)→2; other→5.
+  - Conservative signals consistently outscore Degen signals (verified: Conservative ~70-76, Degen ~29-51 on 2026-04-07 data).
+  - All five component scores stored as separate columns in ev_signals.csv: `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq`.
+  - Components computed in `ev_calculator.py:build_ev_signals()`, stored pre-computed. Discord reads the stored value rather than recalculating.
+  - **Supabase note**: `iq_*` columns not yet in ev_signals Supabase table — add when ready via migration.
 - Game time looked up live from MLB Stats API
 - Bet alerts → `DISCORD_WEBHOOK_CONSERVATIVE`
 - `fire_alerts_from_signals()`: tiered caps — Conservative 5, Moderate 4, Aggressive 3, Degen 1 — sorted by PlaybookIQ descending within each tier

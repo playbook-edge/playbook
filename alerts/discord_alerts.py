@@ -34,47 +34,145 @@ TIERS = [
 
 # ─────────────────────────────────────────────
 # PlaybookIQ composite score (0–100)
+# 5 components measuring confidence and trustworthiness, not EV size.
+# Conservative signals should outscore Degen signals on the same pitcher.
 # ─────────────────────────────────────────────
 
-def calculate_playbook_iq(ev: float, edge: float,
-                           xfip: float = None,
-                           ip_per_start: float = None) -> int:
+def calculate_playbook_iq_components(signal: dict) -> dict:
     """
-    Composite confidence score. Four components:
-      EV quality      0–40 pts   (20% EV = max)
-      Edge size       0–30 pts   (15% edge = max)
-      Pitcher quality 0–20 pts   (xFIP 1.0 = max, 5.0 = 0)
-      Sample size     0–10 pts   (6+ IP/start = max)
+    Compute all five PlaybookIQ components from a signal dict.
+
+    Component 1 — Data Reliability  (25 pts): pitcher historical sample quality
+    Component 2 — Signal Alignment  (25 pts): how many factors support the bet
+    Component 3 — Market Reasonable (25 pts): edge in the believable 2-5% range
+    Component 4 — Tier Confidence   (15 pts): lower-EV tiers are more credible
+    Component 5 — Bet Type Clarity  (10 pts): bet fits the pitcher's K profile
+
+    Returns dict: iq_reliability, iq_alignment, iq_market, iq_tier, iq_clarity,
+    playbookiq (total).
     """
-    # Fix 3: stepped EV curve — capped at 12% to prevent inflated EV from
-    # distorting PlaybookIQ and gaming the alert ordering.
-    # 0 pts at 4% · 20 pts at 6% · 30 pts at 9% · 40 pts at 12%+
-    ev_abs = abs(ev)
-    if ev_abs <= 0.04:
-        ev_score = 0.0
-    elif ev_abs <= 0.06:
-        ev_score = (ev_abs - 0.04) / 0.02 * 20
-    elif ev_abs <= 0.09:
-        ev_score = 20.0 + (ev_abs - 0.06) / 0.03 * 10
-    elif ev_abs <= 0.12:
-        ev_score = 30.0 + (ev_abs - 0.09) / 0.03 * 10
+    ev         = float(signal.get('ev', 0) or 0)
+    model_prob = float(signal.get('model_prob', 0) or 0)
+    imp_prob   = float(signal.get('implied_prob', 0) or 0)
+    edge       = model_prob - imp_prob
+    side       = str(signal.get('side', ''))
+    line       = float(signal.get('line', 0) or 0)
+    prop_type  = str(signal.get('prop_type', 'pitcher_strikeouts'))
+
+    # ── Component 1: Data Reliability (25 pts) ─────────────────────────
+    reliability = signal.get('hist_reliability')
+    low_history = bool(signal.get('low_history', False))
+
+    if reliability is None or (isinstance(reliability, float) and pd.isna(reliability)):
+        rel_score = 10
     else:
-        ev_score = 40.0  # hard cap — anything above 12% is already suspect
+        r = float(reliability)
+        if r >= 80:   rel_score = 25
+        elif r >= 60: rel_score = 18
+        elif r >= 40: rel_score = 10
+        else:         rel_score = 4
 
-    edge_score = min(abs(edge) / 0.15, 1.0) * 30
+    if low_history:
+        rel_score = min(rel_score, 8)
 
-    if xfip is not None and not pd.isna(xfip):
-        xfip_score = max(0.0, (5.0 - float(xfip)) / 4.0) * 20
+    # ── Component 2: Signal Alignment (25 pts) ─────────────────────────
+    # Award points for each contextual factor that supports the bet direction.
+    alignment = 0
+
+    velo_trend = signal.get('velo_trend')
+    if velo_trend is not None and not (isinstance(velo_trend, float) and pd.isna(velo_trend)):
+        vt = float(velo_trend)
+        if (side == 'Over' and vt > 0.3) or (side == 'Under' and vt < -0.3):
+            alignment += 6
+
+    ump_adj = signal.get('umpire_adjustment')
+    if ump_adj is not None and not (isinstance(ump_adj, float) and pd.isna(ump_adj)):
+        ua = float(ump_adj)
+        if (side == 'Over' and ua > 1.0) or (side == 'Under' and ua < 1.0):
+            alignment += 6
+
+    matchup_factor = signal.get('matchup_factor')
+    if matchup_factor is not None and not (isinstance(matchup_factor, float) and pd.isna(matchup_factor)):
+        mf = float(matchup_factor)
+        if (side == 'Over' and mf > 1.0) or (side == 'Under' and mf < 1.0):
+            alignment += 6
+
+    xfip = signal.get('xfip')
+    if xfip is not None and not (isinstance(xfip, float) and pd.isna(xfip)):
+        x = float(xfip)
+        if x < 3.20:    alignment += 4
+        elif x <= 3.80: alignment += 2
+
+    # K props: wind is not a factor — award +3 for neutral (factor is present)
+    if prop_type == 'pitcher_strikeouts':
+        alignment += 3
+
+    alignment = min(alignment, 25)
+
+    # ── Component 3: Market Reasonableness (25 pts) ────────────────────
+    # Small believable edges (2-5%) score highest. Large edges are suspect.
+    ev_suspect = bool(signal.get('ev_suspect', False))
+    edge_abs   = abs(edge)
+
+    if ev_suspect:
+        market_score = 0
+    elif edge_abs <= 0.05:  market_score = 25
+    elif edge_abs <= 0.08:  market_score = 20
+    elif edge_abs <= 0.12:  market_score = 12
+    elif edge_abs <= 0.18:  market_score = 5
+    else:                   market_score = 0
+
+    # ── Component 4: Tier Confidence (15 pts) ─────────────────────────
+    # Conservative = most credible. Degen = least credible.
+    if ev >= 0.20:   tier_score = 0
+    elif ev >= 0.12: tier_score = 4
+    elif ev >= 0.07: tier_score = 10
+    else:            tier_score = 15
+
+    # ── Component 5: Bet Type Clarity (10 pts) ────────────────────────
+    # Does the bet align with the pitcher's actual K profile?
+    k9_used     = signal.get('k9_used')
+    expected_ks = signal.get('expected_ks')
+
+    if prop_type == 'pitcher_innings':
+        clarity_score = 5   # not applicable — neutral
+    elif k9_used is not None and not (isinstance(k9_used, float) and pd.isna(k9_used)):
+        k9 = float(k9_used)
+        if side == 'Over' and k9 > 9.0 and line > 5.5:
+            clarity_score = 10
+        elif side == 'Under' and k9 < 7.5 and line < 5.5:
+            clarity_score = 10
+        elif line <= 3.5:
+            clarity_score = 2
+        elif expected_ks is not None and not (isinstance(expected_ks, float) and pd.isna(expected_ks)):
+            clarity_score = 7 if abs(float(expected_ks) - line) <= 1.5 else 5
+        else:
+            clarity_score = 5
     else:
-        xfip_score = 10.0   # neutral when unknown
+        clarity_score = 5
 
-    if ip_per_start is not None and not pd.isna(ip_per_start):
-        sample_score = min(float(ip_per_start) / 6.0, 1.0) * 10
-    else:
-        sample_score = 5.0  # neutral
+    total = int(round(min(max(
+        rel_score + alignment + market_score + tier_score + clarity_score, 0), 100)))
 
-    total = ev_score + edge_score + xfip_score + sample_score
-    return int(round(min(max(total, 0), 100)))
+    return {
+        'iq_reliability': rel_score,
+        'iq_alignment':   alignment,
+        'iq_market':      market_score,
+        'iq_tier':        tier_score,
+        'iq_clarity':     clarity_score,
+        'playbookiq':     total,
+    }
+
+
+def calculate_playbook_iq(signal: dict) -> int:
+    """
+    Return PlaybookIQ total (0-100) from a signal dict.
+    Reads pre-computed playbookiq column if present; otherwise computes fresh.
+    """
+    piq = signal.get('playbookiq')
+    if piq is not None and not (isinstance(piq, float) and pd.isna(piq)):
+        return int(piq)
+    return calculate_playbook_iq_components(signal)['playbookiq']
 
 
 def iq_bar(score: int) -> str:
@@ -319,7 +417,7 @@ def send_alert(signal: dict, webhook_url: str = None) -> bool:
     ip_per_start = signal.get('ip_per_start')
 
     tier_label, color, tier_emoji = get_tier(ev)
-    iq_score = calculate_playbook_iq(ev, edge, xfip, ip_per_start)
+    iq_score = calculate_playbook_iq(signal)
 
     odds_display = f"{int(signal['odds']):+d}"
     game_time    = get_game_time(str(signal.get('matchup', '')))
@@ -464,11 +562,7 @@ def fire_alerts_from_signals(signals_df: pd.DataFrame,
         return 'CONSERVATIVE'
 
     def _iq(row) -> int:
-        edge = float(row['model_prob']) - float(row['implied_prob'])
-        return calculate_playbook_iq(
-            float(row['ev']), edge,
-            row.get('xfip'), row.get('ip_per_start')
-        )
+        return calculate_playbook_iq(row.to_dict())
 
     flagged = signals_df[signals_df['ev'] >= ev_threshold].copy()
 
@@ -869,7 +963,7 @@ def send_daily_card(signals_df: pd.DataFrame,
             color      = 0x9B59B6       # purple — same as natural Degen
 
         # IQ bar — ▓░ for Discord, ##.. for terminal
-        iq_score       = calculate_playbook_iq(ev, edge, xfip, ip_ps)
+        iq_score       = calculate_playbook_iq(signal)
         filled         = round(iq_score / 10)
         iq_bar_discord = '\u2593' * filled + '\u2591' * (10 - filled)
         iq_bar_term    = '#' * filled + '.' * (10 - filled)
