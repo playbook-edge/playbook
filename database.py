@@ -373,14 +373,20 @@ def log_closing_line(record: dict):
 # ─────────────────────────────────────────────
 
 def log_pipeline_run(run_date, steps_passed: int, steps_failed: int,
-                     notes: str = ''):
+                     notes: str = '', odds_api_quota: int = None):
     """
     Record a completed pipeline run.
     Called at the end of main.py so you have a full history of daily runs.
+    odds_api_quota: remaining API requests this month, captured from the scraper.
     """
     client = get_client()
     if client is None:
         return
+
+    # Append quota to notes so it's visible even without a schema migration
+    if odds_api_quota is not None:
+        quota_note = f'odds_api_quota:{odds_api_quota}'
+        notes = f'{notes} | {quota_note}' if notes else quota_note
 
     try:
         client.table('pipeline_runs').insert({

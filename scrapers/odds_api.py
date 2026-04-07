@@ -25,6 +25,7 @@ from config import ODDS_API_KEY
 
 RAW_DIR     = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
 OUTPUT_PATH = os.path.join(RAW_DIR, 'todays_props.csv')
+QUOTA_PATH  = os.path.join(RAW_DIR, 'odds_api_quota.txt')   # persists quota for pipeline log
 
 BASE_URL    = 'https://api.the-odds-api.com/v4'
 SPORT       = 'baseball_mlb'
@@ -35,10 +36,52 @@ DELAY       = 2   # seconds between event requests (API quota is per-request)
 
 
 # ---------------------------------------------------------------------------
+# Quota guard — fires Discord health alerts when budget is running low
+# ---------------------------------------------------------------------------
+
+def _check_quota_and_alert(resp) -> int | None:
+    """
+    Read x-requests-remaining from the API response header.
+    Fires a Discord health alert at two thresholds:
+      < 100 requests  →  warning  (consider upgrading)
+      <  25 requests  →  critical (🚨 prefix)
+    Returns the remaining count as an int, or None if the header is missing.
+    """
+    try:
+        remaining = int(resp.headers.get('x-requests-remaining', -1))
+    except (TypeError, ValueError):
+        return None
+    if remaining < 0:
+        return None
+
+    if remaining < 25:
+        try:
+            from alerts.discord_alerts import send_error_alert
+            send_error_alert(
+                'Odds API Quota',
+                f'🚨 Only {remaining} requests remaining this month — consider upgrading plan'
+            )
+        except Exception as e:
+            print(f'  Quota critical alert error: {e}')
+    elif remaining < 100:
+        try:
+            from alerts.discord_alerts import send_error_alert
+            send_error_alert(
+                'Odds API Quota',
+                f'Only {remaining} requests remaining this month — consider upgrading plan'
+            )
+        except Exception as e:
+            print(f'  Quota alert error: {e}')
+
+    return remaining
+
+
+# ---------------------------------------------------------------------------
 # Step 1: Get today's MLB events
 # ---------------------------------------------------------------------------
 
 def get_todays_events():
+    """Fetch today's MLB events. Returns (events_list, remaining_quota)."""
     url = f'{BASE_URL}/sports/{SPORT}/events'
     params = {
         'apiKey':      ODDS_API_KEY,
@@ -47,10 +90,9 @@ def get_todays_events():
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
 
-    # Log remaining quota
-    remaining = resp.headers.get('x-requests-remaining', 'unknown')
     used      = resp.headers.get('x-requests-used', 'unknown')
-    print(f"  API quota — used: {used}, remaining: {remaining}")
+    remaining = _check_quota_and_alert(resp)
+    print(f"  API quota — used: {used}, remaining: {remaining if remaining is not None else 'unknown'}")
 
     events = resp.json()
 
@@ -62,7 +104,7 @@ def get_todays_events():
         if game_date == today_str:
             todays.append(e)
 
-    return todays
+    return todays, remaining
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +112,7 @@ def get_todays_events():
 # ---------------------------------------------------------------------------
 
 def get_event_props(event_id, home_team, away_team):
+    """Fetch props for one event. Returns (rows_list, remaining_quota)."""
     url = f'{BASE_URL}/sports/{SPORT}/events/{event_id}/odds'
     params = {
         'apiKey':       ODDS_API_KEY,
@@ -82,8 +125,10 @@ def get_event_props(event_id, home_team, away_team):
 
     if resp.status_code == 422:
         # Event exists but no props market available yet
-        return []
+        return [], None
     resp.raise_for_status()
+
+    remaining = _check_quota_and_alert(resp)
 
     data = resp.json()
     rows = []
@@ -125,7 +170,7 @@ def get_event_props(event_id, home_team, away_team):
 
             rows.extend(player_lines.values())
 
-    return rows
+    return rows, remaining
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +193,7 @@ def run():
 
     # 1. Today's events
     print('\nFetching today\'s MLB events...')
-    events = get_todays_events()
+    events, quota_remaining = get_todays_events()
     print(f'  Found {len(events)} games today.')
 
     if not events:
@@ -165,9 +210,21 @@ def run():
         eid   = event['id']
         print(f'  [{i}/{len(events)}] {away} @ {home}')
 
-        rows = get_event_props(eid, home, away)
+        rows, evt_quota = get_event_props(eid, home, away)
+        if evt_quota is not None:
+            quota_remaining = evt_quota   # keep updating to track most recent
         all_rows.extend(rows)
         time.sleep(DELAY)
+
+    # Write final quota to file so the pipeline logger can include it
+    if quota_remaining is not None:
+        try:
+            os.makedirs(RAW_DIR, exist_ok=True)
+            with open(QUOTA_PATH, 'w') as _qf:
+                _qf.write(str(quota_remaining))
+            print(f'\n  Final Odds API quota: {quota_remaining} requests remaining this month')
+        except Exception as _e:
+            print(f'  Could not write quota file: {_e}')
 
     # 3. Build dataframe
     if not all_rows:

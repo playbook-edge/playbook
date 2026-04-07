@@ -46,7 +46,20 @@ def calculate_playbook_iq(ev: float, edge: float,
       Pitcher quality 0–20 pts   (xFIP 1.0 = max, 5.0 = 0)
       Sample size     0–10 pts   (6+ IP/start = max)
     """
-    ev_score = min(abs(ev) / 0.20, 1.0) * 40
+    # Fix 3: stepped EV curve — capped at 12% to prevent inflated EV from
+    # distorting PlaybookIQ and gaming the alert ordering.
+    # 0 pts at 4% · 20 pts at 6% · 30 pts at 9% · 40 pts at 12%+
+    ev_abs = abs(ev)
+    if ev_abs <= 0.04:
+        ev_score = 0.0
+    elif ev_abs <= 0.06:
+        ev_score = (ev_abs - 0.04) / 0.02 * 20
+    elif ev_abs <= 0.09:
+        ev_score = 20.0 + (ev_abs - 0.06) / 0.03 * 10
+    elif ev_abs <= 0.12:
+        ev_score = 30.0 + (ev_abs - 0.09) / 0.03 * 10
+    else:
+        ev_score = 40.0  # hard cap — anything above 12% is already suspect
 
     edge_score = min(abs(edge) / 0.15, 1.0) * 30
 

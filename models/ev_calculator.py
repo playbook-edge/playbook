@@ -469,6 +469,7 @@ def build_ev_signals(props_df:    pd.DataFrame,
         hist_reliability = None
         k9_trend         = 'NEW'
         blended_k9       = k9   # default: unblended
+        bl               = None  # baseline lookup result — reused for xFIP fallback
 
         if baselines_df is not None:
             bl = lookup_baseline(player, baselines_df)
@@ -677,11 +678,18 @@ def build_ev_signals(props_df:    pd.DataFrame,
             kelly_under = kelly_stake(model_under, under_odds, bankroll,
                                       max_kelly=KELLY_CAPS[tier_under])
 
-        # Pull xFIP for the Discord embed (nice-to-have, not required)
+        # Pull xFIP — current season first, then historical baseline, then league avg
+        # Fix 2: early in the season (before ~mid-April) FanGraphs has no xFIP yet.
+        # Falling back to hist_xfip from player_baselines.csv keeps PlaybookIQ accurate.
+        # If neither is available, 4.20 is the MLB league average — neutral, not zero.
         xfip_val = None
         if stats_name:
             st = stats_df[stats_df['name'] == stats_name].iloc[0]
             xfip_val = st.get('xfip') if pd.notna(st.get('xfip')) else None
+        if xfip_val is None and bl is not None and pd.notna(bl.get('hist_xfip')):
+            xfip_val = float(bl['hist_xfip'])   # historical 2yr weighted xFIP
+        if xfip_val is None:
+            xfip_val = 4.20                     # league average — prevents scoring zero
 
         base = {
             'player':           player,
@@ -878,6 +886,18 @@ def run():
     print(f'Pitchers in Statcast data:   {len(savant_df)}')
     print(f'Prop lines to evaluate:      {len(props_df)}')
 
+    # Fix 2 — scope report: how many of today's starters have no current xFIP?
+    # This is expected all of April until FanGraphs populates the season leaderboard.
+    if 'xfip' in stats_df.columns and not savant_df.empty:
+        today_names   = set(savant_df['name'].dropna().tolist())
+        matched_stats = stats_df[stats_df['name'].isin(today_names)]
+        none_xfip_ct  = int(matched_stats['xfip'].isna().sum())
+        missing_ct    = len(today_names) - len(matched_stats)
+        print(f'\n  xFIP scope ({len(today_names)} starters today):')
+        print(f'    {none_xfip_ct} matched in FanGraphs stats but xFIP = None')
+        print(f'    {missing_ct} not found in FanGraphs stats at all')
+        print(f'    -> both groups fall back to hist_xfip or 4.20 league avg (Fix 2)')
+
     # Load team K-rates (optional — degrades gracefully if missing)
     krates_path = os.path.join(RAW, 'team_krates.csv')
     krates_df   = pd.read_csv(krates_path) if os.path.exists(krates_path) else None
@@ -928,7 +948,26 @@ def run():
     if suspect_count > 0:
         print(f'\n  ⚠  {suspect_count} signal(s) flagged ev_suspect (EV > 15% on live prop) — logged but excluded from Discord')
 
-    # Save full results (includes suspect signals — for the paper trail)
+    # Fix 1 — Deduplicate across books before alerts and paper trades.
+    # When the same pitcher prop (same player + prop_type + side + line) appears
+    # from multiple books, keep only the row with the best American odds (highest
+    # payout).  Deduplicated-away rows get duplicate=True so they're still in
+    # ev_signals.csv and Supabase for reference, but excluded from Discord and
+    # paper trading so we never send duplicate alerts for the same bet.
+    signals['duplicate'] = False
+    if not signals.empty:
+        dedup_keys = ['player', 'prop_type', 'side', 'line']
+        for _, grp in signals.groupby(dedup_keys):
+            if len(grp) > 1:
+                best_idx = grp['odds'].idxmax()   # highest American odds = best payout
+                dup_idxs = grp.index.difference([best_idx])
+                signals.loc[dup_idxs, 'duplicate'] = True
+        dup_count = int(signals['duplicate'].sum())
+        if dup_count > 0:
+            print(f'\n  Fix 1 — Deduplication: {dup_count} row(s) marked duplicate '
+                  f'(same prop at a lower-payout book — logged but excluded from alerts)')
+
+    # Save full results (includes suspect and duplicate rows — for the paper trail)
     out_path = os.path.join(PROCESSED, 'ev_signals.csv')
     signals.to_csv(out_path, index=False)
     print(f'\nFull results saved to: {os.path.normpath(out_path)}')
@@ -980,9 +1019,13 @@ def run():
         print(f'  Real props will show tighter edges (1-6% on good plays, not 10-40%).')
         print(f'  Degen-tier alerts on synthetic data are expected and not meaningful.')
 
-    # Alerts and paper trades exclude ev_suspect signals.
-    # Suspects are still in ev_signals.csv and Supabase for the paper trail.
-    alerts_df = signals[~signals['ev_suspect']].copy() if 'ev_suspect' in signals.columns else signals
+    # Alerts and paper trades exclude ev_suspect AND duplicate signals.
+    # Both groups remain in ev_signals.csv and Supabase for the paper trail.
+    alerts_df = signals.copy()
+    if 'ev_suspect' in alerts_df.columns:
+        alerts_df = alerts_df[~alerts_df['ev_suspect']]
+    if 'duplicate' in alerts_df.columns:
+        alerts_df = alerts_df[~alerts_df['duplicate']]
 
     # --- Fire Discord daily card ---
     print(f'\n--- Firing Discord Daily Card ---')

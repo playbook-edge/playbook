@@ -200,14 +200,27 @@ def main():
     except Exception as e:
         logger.log(f'  Health summary failed: {e}')
 
+    # Read Odds API quota written by step_odds (odds_api.py)
+    odds_quota = None
+    try:
+        quota_path = os.path.join(ROOT, 'data', 'raw', 'odds_api_quota.txt')
+        if os.path.exists(quota_path):
+            with open(quota_path) as _qf:
+                _val = _qf.read().strip()
+                if _val and _val != '-1':
+                    odds_quota = int(_val)
+    except Exception:
+        pass
+
     # Log run to Supabase
     try:
         from database import log_pipeline_run
         log_pipeline_run(
-            run_date     = datetime.now().date(),
-            steps_passed = passed,
-            steps_failed = 6 - passed,
-            notes        = ', '.join(f'{k}: {v["note"]}' for k, v in results.items() if not v['ok'])
+            run_date        = datetime.now().date(),
+            steps_passed    = passed,
+            steps_failed    = 6 - passed,
+            notes           = ', '.join(f'{k}: {v["note"]}' for k, v in results.items() if not v['ok']),
+            odds_api_quota  = odds_quota,
         )
     except Exception as e:
         logger.log(f'  Supabase pipeline log error: {e}')
