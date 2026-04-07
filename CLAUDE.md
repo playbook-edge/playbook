@@ -97,6 +97,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - Captures pitcher throwing hand (R/L) from MLB Stats API, saved as `throws` column
 - **avg_ip**: calls `statsapi.mlb.com/api/v1/people/{id}?hydrate=stats(...)` per starter to get current 2026 IP/GS; stored as `avg_ip` in savant_today.csv
 - **hist_avg_ip**: weighted 2024+2025 average IP/start from pitcher_stats_all.csv; stored alongside `avg_ip` for blending
+- **curr_gs**: current 2026 games started, also from the same MLB Stats API call; stored as `curr_gs` in savant_today.csv. Used by ev_calculator as the blending weight source when FanGraphs is unavailable.
 - **Known quirk**: accented names (e.g. Vásquez) print garbled in Windows terminal — data in CSV is correct
 
 ### `scrapers/fangraphs.py` — WORKING
@@ -225,7 +226,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 
 | File | Updated | Contents |
 |------|---------|----------|
-| `data/raw/savant_today.csv` | Daily | Today's starters: k_pct, velo, velo_trend, spin_rate, pitch_mix, babip, throws, avg_ip, hist_avg_ip |
+| `data/raw/savant_today.csv` | Daily | Today's starters: k_pct, velo, velo_trend, spin_rate, pitch_mix, babip, throws, avg_ip, hist_avg_ip, curr_gs |
 | `data/raw/weather_today.csv` | Daily | Game-day weather per home team: wind_label, wind_factor, temp_f, precip_pct |
 | `data/raw/pitcher_stats.csv` | Daily | Season leaderboard: k9, xfip, fip, babip |
 | `data/raw/team_krates.csv` | Daily | Team K% vs RHP and LHP |

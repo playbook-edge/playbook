@@ -128,20 +128,22 @@ def _hist_ip_for(name: str, hist_lookup: dict) -> float | None:
     return None
 
 
-def fetch_avg_ip(mlb_id, name, hist_lookup: dict) -> tuple[float, float | None]:
+def fetch_avg_ip(mlb_id, name, hist_lookup: dict) -> tuple[float, float | None, int]:
     """
-    Returns (avg_ip, hist_avg_ip) for a pitcher.
+    Returns (avg_ip, hist_avg_ip, curr_gs) for a pitcher.
 
     avg_ip      — current 2026 season IP/GS from MLB Stats API.
                   Falls back to hist_avg_ip, then 5.5 if API returns 0 starts.
     hist_avg_ip — weighted 2024+2025 average IP/start (None if not in history).
+    curr_gs     — current 2026 games started (0 if season hasn't started yet).
 
-    Both values are returned so ev_calculator can blend them for early-season
-    starts the same way it blends K/9.
+    curr_gs is saved to savant_today.csv so ev_calculator can use it for
+    blending weight without depending on FanGraphs pitcher_stats.csv.
     """
     DEFAULT_IP  = 5.5
     hist_ip     = _hist_ip_for(name, hist_lookup)
     current_ip  = None
+    curr_gs     = 0
 
     try:
         url  = (
@@ -161,6 +163,7 @@ def fetch_avg_ip(mlb_id, name, hist_lookup: dict) -> tuple[float, float | None]:
             if gs > 0:
                 ip = _parse_ip(stat.get('inningsPitched', '0'))
                 current_ip = round(ip / gs, 2)
+                curr_gs    = gs
                 break
     except Exception as e:
         print(f"    avg_ip API error for {name}: {e}")
@@ -169,7 +172,7 @@ def fetch_avg_ip(mlb_id, name, hist_lookup: dict) -> tuple[float, float | None]:
     if current_ip is None:
         current_ip = hist_ip if hist_ip is not None else DEFAULT_IP
 
-    return current_ip, hist_ip
+    return current_ip, hist_ip, curr_gs
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +325,8 @@ def run():
         print(f"  [{i}/{len(starters)}] {p['name']} — {p['team']}")
         sc_data              = fetch_pitcher_statcast(p['mlb_id'], p['name'])
         metrics              = compute_metrics(sc_data)
-        avg_ip, hist_avg_ip  = fetch_avg_ip(p['mlb_id'], p['name'], hist_ip)
-        print(f"    avg_ip = {avg_ip} IP/start  (hist: {hist_avg_ip})")
+        avg_ip, hist_avg_ip, curr_gs = fetch_avg_ip(p['mlb_id'], p['name'], hist_ip)
+        print(f"    avg_ip = {avg_ip} IP/start  curr_gs = {curr_gs}  (hist: {hist_avg_ip})")
         rows.append({
             'name':         p['name'],
             'team':         p['team'],
@@ -337,6 +340,7 @@ def run():
             'babip':        metrics['babip'],
             'avg_ip':       avg_ip,
             'hist_avg_ip':  hist_avg_ip,
+            'curr_gs':      curr_gs,
         })
 
     report = pd.DataFrame(rows)

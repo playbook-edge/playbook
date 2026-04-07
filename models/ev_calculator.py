@@ -435,23 +435,30 @@ def build_ev_signals(props_df:    pd.DataFrame,
         low_history   = total_hist_gs < 8
 
         # --- Match to FanGraphs stats (K/9, IP per start) ---
-        stats_name = match_name(player, stats_df['name'])
+        # Primary: FanGraphs pitcher_stats.csv (k9, starts, ip).
+        # Fallback: Statcast savant_today.csv (k_pct → k9, avg_ip, curr_gs).
+        # FanGraphs has been blocking Railway with 403 since early 2026 —
+        # the savant fallback keeps the model fully functional without it.
+        stats_name = match_name(player, stats_df['name']) if not stats_df.empty else None
         if stats_name:
             st = stats_df[stats_df['name'] == stats_name].iloc[0]
             k9           = float(st['k9'])
             curr_starts  = float(st.get('starts', 0))
             ip_per_start = float(st['ip']) / max(curr_starts, 1)
         else:
-            curr_starts = 0.0
-            # Fall back to Statcast K% * ~24 estimated batters faced
+            # FanGraphs unavailable — build from Statcast + MLB Stats API data
             sv_name = match_name(player, savant_df['name'])
             if sv_name:
                 sv = savant_df[savant_df['name'] == sv_name].iloc[0]
                 if pd.notna(sv.get('k_pct')):
-                    # Convert K% to approximate K/9
-                    # ~4.3 batters per inning, so K/9 ≈ k_pct * 4.3 * 9
+                    # K% × 38.7 ≈ K/9  (4.3 batters/inning × 9 innings)
                     k9 = float(sv['k_pct']) * 38.7
-                    ip_per_start = 5.5   # league average default
+                    # avg_ip from MLB Stats API (IP/GS) — more accurate than 5.5 default
+                    avg_ip_sv = sv.get('avg_ip')
+                    ip_per_start = float(avg_ip_sv) if pd.notna(avg_ip_sv) else 5.5
+                    # curr_gs from MLB Stats API — drives blending weight
+                    curr_gs_sv = sv.get('curr_gs')
+                    curr_starts = float(curr_gs_sv) if pd.notna(curr_gs_sv) else 0.0
                 else:
                     continue   # no stats available — skip
             else:
