@@ -509,10 +509,11 @@ def build_ev_signals(props_df:    pd.DataFrame,
         sv_lookup = match_name(player, savant_df['name'])
         sv_row    = savant_df[savant_df['name'] == sv_lookup].iloc[0] if sv_lookup else None
 
-        throws     = 'R'
-        velo_trend = None
-        spin_rate  = None
-        pitch_mix  = None
+        throws         = 'R'
+        velo_trend     = None
+        spin_rate      = None
+        pitch_mix      = None
+        innings_capped = False
 
         if sv_row is not None:
             t = sv_row.get('throws')
@@ -549,6 +550,13 @@ def build_ev_signals(props_df:    pd.DataFrame,
                     else:
                         hist_w = 0.0
                     ip_per_start = round((1 - hist_w) * float(ai) + hist_w * float(hist_ai), 2)
+                    # Innings cap detection: if ≥3 starts and blended IP is >1.0 inning
+                    # below the historical baseline, the pitcher is likely on a managed
+                    # innings limit.  Reduce expected IP by another 0.5 innings to avoid
+                    # over-valuing strikeout counts on a curtailed outing.
+                    if curr_starts >= 3 and ip_per_start < float(hist_ai) - 1.0:
+                        innings_capped = True
+                        ip_per_start   = round(ip_per_start - 0.5, 2)
                 else:
                     ip_per_start = float(ai)
 
@@ -565,9 +573,10 @@ def build_ev_signals(props_df:    pd.DataFrame,
         # Look up the opposing lineup's K-rate vs this pitcher's hand.
         # A strikeout-prone lineup boosts expected Ks; a contact lineup lowers them.
         # Only applies to strikeout props (innings props are unaffected by K-rate).
-        opp_team       = None
-        opp_k_pct      = None
-        matchup_factor = 1.0
+        opp_team         = None
+        opp_k_pct        = None
+        matchup_factor   = 1.0
+        matchup_pa_count = None
 
         if krates_df is not None and prop_type != 'pitcher_innings':
             # Pitcher's team code from stats_df
@@ -578,6 +587,20 @@ def build_ev_signals(props_df:    pd.DataFrame,
             opp_team, opp_k_pct, matchup_factor = lookup_opp_krate(
                 pitcher_team, str(prop.get('matchup', '')), throws, krates_df
             )
+
+            # PA threshold blending: if the opposing team has fewer than 150 PA
+            # vs this pitcher's handedness, their K-rate is too noisy to trust.
+            # Blend 30% current / 70% league average (22.5%) to dampen early noise.
+            if opp_team is not None:
+                pa_col  = 'pa_vs_rhp' if str(throws).upper() == 'R' else 'pa_vs_lhp'
+                opp_row = krates_df[krates_df['team'] == opp_team]
+                if not opp_row.empty:
+                    pa_val           = opp_row.iloc[0].get(pa_col)
+                    matchup_pa_count = int(pa_val) if pa_val is not None and pd.notna(pa_val) else None
+                    if matchup_pa_count is not None and matchup_pa_count < 150 and opp_k_pct is not None:
+                        league_avg     = 0.225
+                        opp_k_pct      = round(0.30 * opp_k_pct + 0.70 * league_avg, 4)
+                        matchup_factor = round(opp_k_pct / league_avg, 4)
 
         # ── Umpire adjustment ─────────────────────────────────────────────
         # Match this prop's matchup to today's home plate umpire profile.
@@ -717,6 +740,8 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'umpire_name':       umpire_name,
             'umpire_adjustment': round(umpire_adjustment, 3),
             'low_history':       low_history,
+            'innings_capped':    innings_capped,
+            'matchup_pa_count':  matchup_pa_count,
             'ev_suspect':        False,   # overwritten in run() for live props with EV > 15%
             # ── Weather context (informational — not applied to Poisson model) ──
             **_weather_cols(prop.get('matchup', ''), weather_lookup),

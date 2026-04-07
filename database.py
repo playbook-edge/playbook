@@ -144,6 +144,8 @@ def log_ev_signals(signals_df: pd.DataFrame, run_date=None) -> int:
             'low_history':           bool(_clean(r.get('low_history'))) if _clean(r.get('low_history')) is not None else False,
             'ev_suspect':            bool(_clean(r.get('ev_suspect'))) if _clean(r.get('ev_suspect')) is not None else False,
             'duplicate':             bool(_clean(r.get('duplicate'))) if _clean(r.get('duplicate')) is not None else False,
+            'innings_capped':        bool(_clean(r.get('innings_capped'))) if _clean(r.get('innings_capped')) is not None else False,
+            'matchup_pa_count':      int(_clean(r.get('matchup_pa_count'))) if _clean(r.get('matchup_pa_count')) is not None else None,
             # Weather columns
             'weather_wind_label':    _clean(r.get('weather_wind_label')),
             'weather_wind_factor':   _clean(r.get('weather_wind_factor')),

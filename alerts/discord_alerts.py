@@ -267,6 +267,8 @@ def generate_summary(signal: dict) -> str:
             facts.append('Note: model probability was capped at 75% ceiling')
         if low_line_note and not pd.isna(low_line_note):
             facts.append(f'Note: {low_line_note}')
+        if signal.get('innings_capped'):
+            facts.append('Note: pitcher appears to be on an innings limit.')
         facts.append(f'Model probability: {model_prob:.0%} | Book implied: {implied_prob:.0%}')
         facts.append(f'Edge: {edge:+.0%} | EV: {ev:+.0%}')
 
