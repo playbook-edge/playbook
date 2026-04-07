@@ -143,6 +143,7 @@ def log_ev_signals(signals_df: pd.DataFrame, run_date=None) -> int:
             'kelly_cap_applied':     bool(_clean(r.get('kelly_cap_applied'))) if _clean(r.get('kelly_cap_applied')) is not None else False,
             'low_history':           bool(_clean(r.get('low_history'))) if _clean(r.get('low_history')) is not None else False,
             'ev_suspect':            bool(_clean(r.get('ev_suspect'))) if _clean(r.get('ev_suspect')) is not None else False,
+            'duplicate':             bool(_clean(r.get('duplicate'))) if _clean(r.get('duplicate')) is not None else False,
             # Weather columns
             'weather_wind_label':    _clean(r.get('weather_wind_label')),
             'weather_wind_factor':   _clean(r.get('weather_wind_factor')),
