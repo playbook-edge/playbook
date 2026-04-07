@@ -325,7 +325,7 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 
 All tables confirmed live and accepting writes as of 2026-04-07.
 
-`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `duplicate` column added 2026-04-06. `innings_capped` (BOOLEAN) and `matchup_pa_count` (INTEGER) columns added 2026-04-07.
+`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `duplicate` column added 2026-04-06. `innings_capped` (BOOLEAN) and `matchup_pa_count` (INTEGER) columns added 2026-04-07. `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq` (all INTEGER) added 2026-04-07 for PlaybookIQ redesign — migration confirmed live.
 
 `pipeline_runs` notes field now includes `odds_api_quota:N` appended by `log_pipeline_run()` — written by `main.py` reading `data/raw/odds_api_quota.txt` after the odds scraper step. No schema migration needed.
 
