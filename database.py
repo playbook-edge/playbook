@@ -151,6 +151,13 @@ def log_ev_signals(signals_df: pd.DataFrame, run_date=None) -> int:
             'weather_wind_factor':   _clean(r.get('weather_wind_factor')),
             'weather_temp_f':        _clean(r.get('weather_temp_f')),
             'weather_precip_pct':    int(_clean(r.get('weather_precip_pct'))) if _clean(r.get('weather_precip_pct')) is not None else None,
+            # PlaybookIQ component scores (added 2026-04-07)
+            'iq_reliability':        int(_clean(r.get('iq_reliability'))) if _clean(r.get('iq_reliability')) is not None else None,
+            'iq_alignment':          int(_clean(r.get('iq_alignment')))   if _clean(r.get('iq_alignment'))   is not None else None,
+            'iq_market':             int(_clean(r.get('iq_market')))      if _clean(r.get('iq_market'))      is not None else None,
+            'iq_tier':               int(_clean(r.get('iq_tier')))        if _clean(r.get('iq_tier'))        is not None else None,
+            'iq_clarity':            int(_clean(r.get('iq_clarity')))     if _clean(r.get('iq_clarity'))     is not None else None,
+            'playbookiq':            int(_clean(r.get('playbookiq')))     if _clean(r.get('playbookiq'))     is not None else None,
         })
 
     try:
