@@ -110,6 +110,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - Skips re-fetch if file already exists (cached to disk)
 - Saves per-year CSVs + combined `pitcher_stats_all.csv`
 - Run once to seed; re-run at end of each season to add the new year
+- **2026-04-07 fix**: `pitcher_stats_2024.csv`, `pitcher_stats_2025.csv`, and `pitcher_stats_all.csv` are now committed directly to the repo (`.gitignore` exceptions added). FanGraphs was blocking the daily re-fetch on Railway (ephemeral disk = files never persisted). Since those seasons are over and the data never changes, committing them is the right permanent fix. To add a new season, pull it locally and commit the new CSV.
 
 ### `scrapers/odds_api.py` — WORKING (needs API key)
 - Fetches today's MLB events, then per-event pitcher strikeout props
@@ -481,3 +482,4 @@ Positive CLV means the market moved toward our position after we bet — we got 
 - Save all raw data to `data/raw/` before any processing
 - Prefer simple, readable code over clever one-liners
 - After every session, update this file and push to GitHub
+- **Running locally on Windows**: always prefix with `PYTHONIOENCODING=utf-8` — e.g. `PYTHONIOENCODING=utf-8 python main.py`. Without it, emoji/special characters in print statements cause a crash on Windows terminals (cp1252 encoding). Railway (Linux) is unaffected.
