@@ -106,7 +106,8 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - Books: DraftKings, FanDuel, BetMGM
 - Requires `ODDS_API_KEY` in `.env` (the-odds-api.com — free tier: 500 req/month)
 - Props post around 9-10am ET on game days; empty file before then is normal
-- Logs remaining API quota on each run
+- **Quota monitoring**: after every API call, reads `x-requests-remaining` from the response header. Fires `send_error_alert()` to the health channel at two thresholds: warning at <100 remaining, critical (🚨) at <25. Final remaining count is written to `data/raw/odds_api_quota.txt` for the pipeline log.
+- `get_todays_events()` and `get_event_props()` both return remaining quota alongside their data so the scraper always has the freshest count.
 
 ### `models/player_baseline.py` — WORKING
 - Builds per-pitcher historical composites from 2024+2025 data
@@ -136,10 +137,12 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - Flags any prop above 4% EV; saves full results to `ev_signals.csv`
 - **EV threshold**: 2% (changed from 4%) — generates more signals for paper trading validation
 - **ev_suspect flag**: signals where EV > 18% on live props are flagged as suspect — logged to Supabase but excluded from Discord alerts and paper trading. Prevents inflated early-season data from generating fake Degen signals.
+- **duplicate flag**: after all signals are generated, props with the same pitcher + prop_type + side + line appearing from multiple books are deduplicated. Only the row with the best American odds (highest payout) is kept for alerts and paper trading. Lower-payout duplicates get `duplicate=True` — still logged to Supabase for reference but excluded from Discord and paper trades.
+- **xFIP fallback (Fix 2)**: when a pitcher's current-season xFIP is None (common all of April), `build_ev_signals()` falls back to `hist_xfip` from `player_baselines.csv`, then to `4.20` (MLB league average) as a last resort. Prevents the PlaybookIQ xFIP component from scoring a flat neutral when historical data is available. A scope report is printed on each run showing how many of today's starters needed the fallback.
 - **low_history flag**: pitchers with fewer than 8 total GS across 2024+2025 → 95% historical weight, 0.65 probability cap. Protects against injury returnees and callups with tiny historical samples.
 - **Forced Degen**: if no natural 20%+ EV signal exists, the top-ranked signal is force-badged as 🎰 Degen so every daily card has at least one headline pick
 - **Weather integration**: `build_ev_signals()` accepts `weather_df`; `_weather_cols()` helper maps home team to wind/temp/precip. Weather line appears in Discord embeds.
-- ev_signals.csv columns (41 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`
+- ev_signals.csv columns (42 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`, `duplicate`
 
 ### `scrapers/weather_scraper.py` — WORKING
 - **Open-Meteo API** (free, no key): hourly wind speed/direction, temperature, precipitation forecasts keyed on ballpark lat/lon
@@ -184,7 +187,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
   - Claude narrative: 2-3 sentences, casual tone, written for a casual bettor — uses pitcher name, K/9, xFIP, velo trend, opponent context
   - `dry_run=True` prints terminal preview without sending
 - **Tier badges by EV**: Conservative 4-7% (🟢), Moderate 7-12% (🟡), Aggressive 12-20% (🔴), Degen 20%+ (🎰)
-- **PlaybookIQ score (0-100)**: composite of EV (40pts) + edge (30pts) + xFIP quality (20pts) + sample size (10pts)
+- **PlaybookIQ score (0-100)**: composite of EV (40pts) + edge (30pts) + xFIP quality (20pts) + sample size (10pts). EV component uses a stepped curve: 0pts at 4%, 20pts at 6%, 30pts at 9%, 40pts at 12%+ (hard cap). Prevents inflated EV on suspect/synthetic signals from distorting alert ordering — real 8-12% live-prop edges score proportionally higher than before.
 - Game time looked up live from MLB Stats API
 - Bet alerts → `DISCORD_WEBHOOK_CONSERVATIVE`
 - `fire_alerts_from_signals()`: tiered caps — Conservative 5, Moderate 4, Aggressive 3, Degen 1 — sorted by PlaybookIQ descending within each tier
@@ -204,6 +207,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 | `data/raw/pitcher_stats.csv` | Daily | Season leaderboard: k9, xfip, fip, babip |
 | `data/raw/team_krates.csv` | Daily | Team K% vs RHP and LHP |
 | `data/raw/todays_props.csv` | Daily | Live prop lines from books |
+| `data/raw/odds_api_quota.txt` | Daily | Remaining Odds API requests this month (written by odds_api.py, read by main.py for pipeline_runs log) |
 | `data/historical/pitcher_stats_2024.csv` | Once/year | Full 2024 FanGraphs season |
 | `data/historical/pitcher_stats_2025.csv` | Once/year | Full 2025 FanGraphs season |
 | `data/historical/player_baselines.csv` | Daily | 935 pitcher baselines with trends |
@@ -296,7 +300,9 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 
 All tables confirmed live and accepting writes as of 2026-04-06.
 
-`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `database.py` writes all of these on every run.
+`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `database.py` writes all of these on every run. `duplicate` column added 2026-04-06 (no schema migration needed — written by ev_calculator).
+
+`pipeline_runs` notes field now includes `odds_api_quota:N` appended by `log_pipeline_run()` — written by `main.py` reading `data/raw/odds_api_quota.txt` after the odds scraper step. No schema migration needed.
 
 ## Roadmap
 
@@ -363,7 +369,7 @@ Pulls the full 2024 and 2025 FanGraphs season stats for every pitcher. These are
 Builds a composite historical profile for each pitcher: 2-year weighted K/9 (2025 counts double), reliability score (0-100 based on innings, seasons, consistency), and a trend arrow (UP/DOWN/STABLE/NEW comparing current season to historical average). Cached in Supabase for up to 7 days.
 
 **Step 5 — Odds API** (`scrapers/odds_api.py`)
-Fetches live prop lines from DraftKings, FanDuel, and BetMGM for today's pitcher strikeout props. The lines are usually posted around 9-10am ET. This step costs API quota (500 requests/month on the free tier) so it runs once per day at 10:30am when the pipeline fires.
+Fetches live prop lines from DraftKings, FanDuel, and BetMGM for today's pitcher strikeout props. The lines are usually posted around 9-10am ET. This step costs API quota (500 requests/month on the free tier) so it runs once per day at 10:30am when the pipeline fires. After every API call, remaining quota is checked from the response headers — health alerts fire at <100 (warning) and <25 (critical 🚨). Final quota is written to `data/raw/odds_api_quota.txt` and appended to the `pipeline_runs` Supabase record via `main.py`.
 
 **Step 6 — EV Calculator** (`models/ev_calculator.py`)
 This is where all the data comes together. Two prop types are supported: `pitcher_strikeouts` and `pitcher_innings`. For each live prop line, it: (1) builds a blended K/9 and IP estimate from current + historical data, (2) applies adjustments for velocity trend, opposing lineup K-rate, and umpire zone (K props only), (3) uses a Poisson distribution for strikeout lines or a Normal distribution for innings lines to compute the probability of going over or under, (4) compares that probability to the implied probability in the book's odds, (5) calculates EV and Kelly stake. If EV is above 4%, the signal is flagged and sent to Discord.
