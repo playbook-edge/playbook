@@ -282,6 +282,7 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
   - Env vars set in Railway dashboard
   - `railway.json` sets builder only — start command set per-service in Railway UI
 - **Railway — resolve service** (`playbook-resolve`): `python alerts/paper_trading.py auto_resolve`, cron `30 3 * * *` (11:30 PM ET)
+- **Railway — snapshot service** (`playbook-snapshot`): `python scrapers/odds_api.py snapshot`, cron `30 22 * * *` (6:30 PM ET). Fetches current prop lines for all games starting within the next 3 hours, saves to `data/raw/props_gameday_snapshot.csv`, then immediately runs `capture_line_movement()` to write opening vs snapshot comparison to Supabase `line_movement` table.
 - **Railway — readiness dashboard** (`playbook-readiness`): `python alerts/readiness_dashboard.py`, cron `0 13 * * 0` (9am ET Sundays)
 - Ephemeral disk — all persistence goes through Supabase
 
@@ -297,8 +298,9 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 | `statcast_pull_log` | Tracks last Statcast pull date to enable incremental delta fetches | Daily |
 | `player_baselines_cache` | 935-pitcher historical composites | Weekly |
 | `umpire_profiles` | Umpire zone tendency data from umpscorecards.com | Weekly |
+| `line_movement` | Opening vs 6:30 PM snapshot odds comparison for each active paper trade | Per snapshot run |
 
-All tables confirmed live and accepting writes as of 2026-04-06.
+All tables confirmed live and accepting writes as of 2026-04-07.
 
 `ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `database.py` writes all of these on every run. `duplicate` column added 2026-04-06 (no schema migration needed — written by ev_calculator).
 
@@ -318,8 +320,8 @@ All tables confirmed live and accepting writes as of 2026-04-06.
 4. **Pitcher hand-off / innings cap detection**
    If a pitcher's season IP is suspiciously low for their start count, flag as potential innings cap and discount expected IP further. Protects against overvaluing K props on limited young arms (Skenes, post-injury returns).
 
-5. **Line movement tracking**
-   Log a "line at game time" snapshot in addition to opening (10:30am) and closing (resolve). Heavy movement against our position between open and game time is a signal the market knows something we don't.
+5. **Line movement tracking** ✓ BUILT
+   `scrapers/odds_api.py snapshot` → `alerts/paper_trading.py capture_line_movement()`. Railway service `playbook-snapshot`, cron `30 22 * * *` (6:30 PM ET). Saves `data/raw/props_gameday_snapshot.csv` and writes to Supabase `line_movement` table. `movement_direction` is `toward` (market agrees), `against` (market disagrees), or `flat`. Run manually: `python scrapers/odds_api.py snapshot`.
 
 6. **Batter props**
    Expand beyond pitchers to HR, hits, RBI props. Requires new scrapers, new model logic, and new prop types. Later-season project once pitcher-side model is validated.
