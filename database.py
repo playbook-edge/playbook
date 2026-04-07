@@ -438,3 +438,59 @@ def log_pipeline_run(run_date, steps_passed: int, steps_failed: int,
         }).execute()
     except Exception as e:
         print(f'  Supabase pipeline_run error: {e}')
+
+
+# ─────────────────────────────────────────────
+# readiness_history
+# ─────────────────────────────────────────────
+
+def log_readiness_snapshot(record: dict):
+    """
+    Write one row to readiness_history.
+    Called by readiness_dashboard.py after computing the weekly verdict.
+
+    Expected keys:
+      date, verdict, avg_clv_overall, avg_clv_conservative,
+      roi_pct, total_bets, win_rate, bankroll_current, checklist_complete_count
+    """
+    client = get_client()
+    if client is None:
+        return
+
+    row = {
+        'date':                    _clean(record.get('date')),
+        'verdict':                 _clean(record.get('verdict')),
+        'avg_clv_overall':         _clean(record.get('avg_clv_overall')),
+        'avg_clv_conservative':    _clean(record.get('avg_clv_conservative')),
+        'roi_pct':                 _clean(record.get('roi_pct')),
+        'total_bets':              int(_clean(record.get('total_bets'))) if _clean(record.get('total_bets')) is not None else None,
+        'win_rate':                _clean(record.get('win_rate')),
+        'bankroll_current':        _clean(record.get('bankroll_current')),
+        'checklist_complete_count': int(_clean(record.get('checklist_complete_count'))) if _clean(record.get('checklist_complete_count')) is not None else None,
+    }
+
+    try:
+        client.table('readiness_history').insert(row).execute()
+        print(f"  Readiness snapshot saved to Supabase ({record.get('date')}).")
+    except Exception as e:
+        print(f'  Supabase readiness_history insert error: {e}')
+
+
+def get_readiness_history(limit: int = 4) -> list:
+    """
+    Fetch the most recent N rows from readiness_history, newest first.
+    Returns a list of dicts, or [] if unavailable.
+    """
+    client = get_client()
+    if client is None:
+        return []
+    try:
+        resp = (client.table('readiness_history')
+                      .select('*')
+                      .order('date', desc=True)
+                      .limit(limit)
+                      .execute())
+        return resp.data or []
+    except Exception as e:
+        print(f'  Supabase readiness_history read error: {e}')
+        return []

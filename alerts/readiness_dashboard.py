@@ -234,6 +234,93 @@ def compute_readiness_stats() -> dict:
 
 
 # ─────────────────────────────────────────────
+# History helpers
+# ─────────────────────────────────────────────
+
+def _checklist_count(s: dict) -> int:
+    """
+    Count how many of the four GO conditions are currently met (0-4).
+      1. 30+ resolved bets
+      2. avg CLV > 0%
+      3. ROI > 0%
+      4. win_rate >= expected_win_rate (beating break-even)
+    """
+    score = 0
+    if s.get('total_resolved', 0) >= MIN_BETS_FOR_VERDICT:
+        score += 1
+    if s.get('avg_clv') is not None and s['avg_clv'] > 0:
+        score += 1
+    if s.get('roi') is not None and s['roi'] > 0:
+        score += 1
+    if (s.get('win_rate') is not None
+            and s.get('expected_win_rate') is not None
+            and s['win_rate'] >= s['expected_win_rate']):
+        score += 1
+    return score
+
+
+def save_readiness_snapshot(s: dict):
+    """Write today's readiness metrics to the readiness_history Supabase table."""
+    try:
+        from database import log_readiness_snapshot
+        cons_clv = None
+        if s.get('tier_stats') and 'CONSERVATIVE' in s['tier_stats']:
+            cons_clv = s['tier_stats']['CONSERVATIVE'].get('avg_clv')
+
+        log_readiness_snapshot({
+            'date':                    datetime.now().strftime('%Y-%m-%d'),
+            'verdict':                 s.get('verdict'),
+            'avg_clv_overall':         s.get('avg_clv'),
+            'avg_clv_conservative':    cons_clv,
+            'roi_pct':                 s.get('roi'),
+            'total_bets':              s.get('total_resolved'),
+            'win_rate':                s.get('win_rate'),
+            'bankroll_current':        s.get('current_bankroll'),
+            'checklist_complete_count': _checklist_count(s),
+        })
+    except Exception as e:
+        print(f'  Could not save readiness snapshot: {e}')
+
+
+def _build_trend_lines() -> str:
+    """
+    Fetch the last 4 readiness_history rows and format as a compact table string
+    for a Discord embed field.  Returns a placeholder if no history exists yet.
+    """
+    try:
+        from database import get_readiness_history
+        rows = get_readiness_history(limit=4)
+    except Exception as e:
+        return f'Could not load history: {e}'
+
+    if not rows:
+        return 'No history yet — first entry saved today.'
+
+    # Reverse so oldest → newest (rows came back newest-first)
+    rows = list(reversed(rows))
+
+    verdict_icons = {'GO': '✅', 'MONITOR': '⚠️', 'NOT YET': '⏳', 'HOLD': '🛑'}
+    lines = ['```', f"{'Date':<12} {'Verdict':<9} {'CLV':>7} {'ROI':>7} {'ok':>4}", '-' * 42]
+
+    for r in rows:
+        date_str = str(r.get('date', ''))[:10]
+        verdict  = str(r.get('verdict', '—'))
+        icon     = verdict_icons.get(verdict, ' ')
+        clv_val  = r.get('avg_clv_overall')
+        roi_val  = r.get('roi_pct')
+        checks   = r.get('checklist_complete_count')
+
+        clv_str  = f"{clv_val:+.2%}" if clv_val is not None else '  N/A'
+        roi_str  = f"{roi_val:+.1%}" if roi_val is not None else ' N/A'
+        chk_str  = f"{checks}/4"     if checks  is not None else ' —'
+
+        lines.append(f"{date_str:<12} {verdict:<9} {clv_str:>7} {roi_str:>7} {chk_str:>3}")
+
+    lines.append('```')
+    return '\n'.join(lines)
+
+
+# ─────────────────────────────────────────────
 # Terminal preview
 # ─────────────────────────────────────────────
 
@@ -278,6 +365,13 @@ def print_dashboard(s: dict):
             wl   = f"{t['wins']}/{t['losses']}"
             lbl  = tier_labels.get(tier, '')
             print(f"  {lbl} {tier:<12} {t['total']:>5} {wl:>7} {wr:>7} {roi:>8} {clv:>9}")
+
+    print(f"\n  {'-'*50}")
+    print(f"  4-WEEK TREND")
+    print(f"  {'-'*50}")
+    trend = _build_trend_lines()
+    for line in trend.splitlines():
+        print(f"  {line}")
 
     print()
 
@@ -383,6 +477,14 @@ def send_dashboard(s: dict):
             inline=False
         )
 
+    # 4-week trend
+    trend_value = _build_trend_lines()
+    embed.add_embed_field(
+        name='4-Week Trend',
+        value=trend_value,
+        inline=False
+    )
+
     embed.set_footer(text=f'Playbook Weekly Readiness  •  {now}')
     embed.set_timestamp()
 
@@ -404,6 +506,9 @@ def run(preview_only: bool = False):
     print('Computing readiness stats...')
     stats = compute_readiness_stats()
     print_dashboard(stats)
+
+    # Always save to history so trends accumulate even on preview runs
+    save_readiness_snapshot(stats)
 
     if not preview_only:
         send_dashboard(stats)
