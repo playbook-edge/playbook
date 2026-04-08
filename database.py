@@ -152,6 +152,10 @@ def log_ev_signals(signals_df: pd.DataFrame, run_date=None) -> int:
             'weather_wind_factor':   _clean(r.get('weather_wind_factor')),
             'weather_temp_f':        _clean(r.get('weather_temp_f')),
             'weather_precip_pct':    int(_clean(r.get('weather_precip_pct'))) if _clean(r.get('weather_precip_pct')) is not None else None,
+            # Park factor columns (added 2026-04-07)
+            'park_name':             _clean(r.get('park_name')),
+            'park_k_factor':         int(_clean(r.get('park_k_factor'))) if _clean(r.get('park_k_factor')) is not None else None,
+            'park_k_label':          _clean(r.get('park_k_label')),
             # PlaybookIQ component scores (added 2026-04-07)
             'iq_reliability':        int(_clean(r.get('iq_reliability'))) if _clean(r.get('iq_reliability')) is not None else None,
             'iq_alignment':          int(_clean(r.get('iq_alignment')))   if _clean(r.get('iq_alignment'))   is not None else None,

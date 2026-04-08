@@ -23,6 +23,8 @@ from scipy.stats import poisson, norm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from scrapers.park_factors import get_park_k_adjustment, home_team_from_matchup
+
 RAW       = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
 PROCESSED = os.path.join(os.path.dirname(__file__), '..', 'data', 'processed')
 HIST      = os.path.join(os.path.dirname(__file__), '..', 'data', 'historical')
@@ -609,6 +611,22 @@ def build_ev_signals(props_df:    pd.DataFrame,
                         opp_k_pct      = round(0.30 * opp_k_pct + 0.70 * league_avg, 4)
                         matchup_factor = round(opp_k_pct / league_avg, 4)
 
+        # ── Layer 4.5: Park factor adjustment ────────────────────────────────
+        # Ballpark context applied after batter matchup, before umpire.
+        # Only affects strikeout props (innings props not meaningfully affected
+        # by park K-factor in the same way).
+        park_multiplier = 1.0
+        park_label      = 'Neutral park'
+        park_k_factor   = 100
+        park_name_val   = ''
+
+        if prop_type != 'pitcher_innings':
+            home_tm = home_team_from_matchup(str(prop.get('matchup', '')))
+            if home_tm:
+                from scrapers.park_factors import PARK_FACTORS
+                park_multiplier, park_label, park_k_factor = get_park_k_adjustment(home_tm)
+                park_name_val = PARK_FACTORS.get(home_tm, {}).get('park_name', home_tm)
+
         # ── Umpire adjustment ─────────────────────────────────────────────
         # Match this prop's matchup to today's home plate umpire profile.
         # Tight zone (>60th pct) → +3% K probability boost.
@@ -638,8 +656,8 @@ def build_ev_signals(props_df:    pd.DataFrame,
                 umpire_adjustment = float(ump_info.get('k_factor', 1.0))
                 umpire_note       = ump_info.get('note', '')
 
-        # Apply matchup, velocity trend, and umpire factors to blended K/9
-        adjusted_k9 = blended_k9 * matchup_factor * velo_factor * umpire_adjustment
+        # Apply matchup, velocity trend, park factor, and umpire factors to blended K/9
+        adjusted_k9 = blended_k9 * matchup_factor * velo_factor * park_multiplier * umpire_adjustment
 
         # ── Route to the correct probability model ────────────
         if prop_type == 'pitcher_innings':
@@ -760,6 +778,9 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'opp_team':         opp_team,
             'opp_k_pct':        opp_k_pct,
             'matchup_factor':    matchup_factor,
+            'park_name':         park_name_val,
+            'park_k_factor':     park_k_factor,
+            'park_k_label':      park_label,
             'low_line_note':     low_line_note,
             'umpire_name':       umpire_name,
             'umpire_adjustment': round(umpire_adjustment, 3),

@@ -107,7 +107,14 @@ def calculate_playbook_iq_components(signal: dict) -> dict:
     if prop_type == 'pitcher_strikeouts':
         alignment += 3
 
-    alignment = min(alignment, 25)
+    # Park factor aligned with bet direction — up to 3 pts
+    park_k_factor = signal.get('park_k_factor')
+    if park_k_factor is not None and not (isinstance(park_k_factor, float) and pd.isna(park_k_factor)):
+        pkf = int(park_k_factor)
+        if (side == 'Over' and pkf > 103) or (side == 'Under' and pkf < 97):
+            alignment += 3
+
+    alignment = min(alignment, 28)
 
     # ── Component 3: Market Reasonableness (25 pts) ────────────────────
     # Small believable edges (2-5%) score highest. Large edges are suspect.
@@ -151,8 +158,9 @@ def calculate_playbook_iq_components(signal: dict) -> dict:
     else:
         clarity_score = 5
 
-    total = int(round(min(max(
-        rel_score + alignment + market_score + tier_score + clarity_score, 0), 100)))
+    # Max raw points = 28+25+25+15+10 = 103. Scale to keep total at 100.
+    raw   = rel_score + alignment + market_score + tier_score + clarity_score
+    total = int(round(min(max(raw * 100 / 103, 0), 100)))
 
     return {
         'iq_reliability': rel_score,
@@ -1039,6 +1047,13 @@ def send_daily_card(signals_df: pd.DataFrame,
                 wx_emoji = '\u2600\ufe0f'        # ☀️
             temp_str = f'  \u00b7  {float(temp_f):.0f}\u00b0F' if temp_f not in (None, '') and str(temp_f) not in ('None', 'nan') else ''
             desc_lines.append(f'{wx_emoji}  {wind_label}{temp_str}')
+
+        # Park factor line — between weather and narrative
+        park_name_d  = signal.get('park_name')
+        park_k_lbl   = signal.get('park_k_label')
+        park_k_fac   = signal.get('park_k_factor')
+        if park_name_d and str(park_name_d) not in ('None', 'nan', ''):
+            desc_lines.append(f'\U0001f3df\ufe0f  {park_name_d} \u2014 {park_k_lbl} (K-factor: {park_k_fac})')
 
         desc_lines += ['', narrative]
         desc = '\n'.join(desc_lines)

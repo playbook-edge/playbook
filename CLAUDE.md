@@ -157,7 +157,22 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - **Weather integration**: `build_ev_signals()` accepts `weather_df`; `_weather_cols()` helper maps home team to wind/temp/precip. Weather line appears in Discord embeds.
 - **Innings cap detection**: if a pitcher has 3+ FanGraphs-verified starts and their blended IP/start is >1.0 inning below their historical baseline, `innings_capped = True` is set and `ip_per_start` is reduced by another 0.5 innings. Protects against overvaluing K props on managed/limited arms. When triggered, Claude narrative also receives a note: "pitcher appears to be on an innings limit."
 - **Team K-rate PA threshold**: after `lookup_opp_krate()`, checks `pa_vs_rhp` or `pa_vs_lhp` for the opposing team. If <150 PA, blends the current K-rate 30% current / 70% league average (22.5%) to dampen early-season sample noise. Stored in `matchup_pa_count`.
-- ev_signals.csv columns (50 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`, `duplicate`, `innings_capped`, `matchup_pa_count` + `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq`
+- ev_signals.csv columns (54 total): original 25 + `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`, `duplicate`, `innings_capped`, `matchup_pa_count` + `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq` + `xfip_source` + `park_name`, `park_k_factor`, `park_k_label`
+
+### `scrapers/park_factors.py` — WORKING
+- Static dictionary of all 30 MLB stadiums keyed by full team name (matching savant_today.csv / matchup strings)
+- Each entry: `park_name`, `general_factor` (3yr avg run park factor, centered at 100), `k_factor` (K-specific, centered at 100), `dome` (bool), `altitude_ft`
+- `get_park_k_adjustment(home_team)` → `(k_multiplier, park_label, k_factor)`:
+  - k_factor >108 → 1.04 "K-boosting park"; 103-108 → 1.02 "Slight K boost"; 97-103 → 1.00 "Neutral park"; 92-97 → 0.98 "Slight K suppressor"; <92 → 0.96 "K-suppressing park"
+  - Coors Field (altitude >4000 ft) → 0.94 "Coors — significant K suppressor"
+- `home_team_from_matchup(matchup)` — extracts home team from "Away @ Home" string
+- Notable parks: Tropicana Field (109, K-boosting), Seattle T-Mobile (104), Fenway/Oracle/Petco (95-96, K-suppressing), Coors (88, extreme suppressor)
+- Wired into ev_calculator as Layer 4.5 — multiplier applied to adjusted_k9 after batter matchup, before umpire adjustment
+- Three columns in ev_signals.csv: `park_name`, `park_k_factor`, `park_k_label`
+- Park factor aligned with bet direction adds up to +3 pts to PlaybookIQ Signal Alignment component
+- Park line shown in Discord daily card embeds: 🏟️ {park_name} — {label} (K-factor: {value})
+- No API calls — fully static, no rate limiting needed
+- **Supabase**: `park_name` (TEXT), `park_k_factor` (INTEGER), `park_k_label` (TEXT) columns added to ev_signals table 2026-04-07
 
 ### `scrapers/weather_scraper.py` — WORKING
 - **Open-Meteo API** (free, no key): hourly wind speed/direction, temperature, precipitation forecasts keyed on ballpark lat/lon
@@ -327,7 +342,7 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 
 All tables confirmed live and accepting writes as of 2026-04-07.
 
-`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `duplicate` column added 2026-04-06. `innings_capped` (BOOLEAN) and `matchup_pa_count` (INTEGER) columns added 2026-04-07. `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq` (all INTEGER) added 2026-04-07 for PlaybookIQ redesign — migration confirmed live.
+`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `duplicate` column added 2026-04-06. `innings_capped` (BOOLEAN) and `matchup_pa_count` (INTEGER) columns added 2026-04-07. `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq` (all INTEGER) added 2026-04-07 for PlaybookIQ redesign — migration confirmed live. `xfip_source` (TEXT), `park_name` (TEXT), `park_k_factor` (INTEGER), `park_k_label` (TEXT) added 2026-04-07 — run migration before next pipeline.
 
 `pipeline_runs` notes field now includes `odds_api_quota:N` appended by `log_pipeline_run()` — written by `main.py` reading `data/raw/odds_api_quota.txt` after the odds scraper step. No schema migration needed.
 
