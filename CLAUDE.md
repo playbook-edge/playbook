@@ -211,22 +211,28 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 
 ### `alerts/discord_alerts.py` — WORKING
 - **Daily card** (`send_daily_card`): the main alert function — sends all flagged bets as one Discord message (one embed per bet, stacked). Called from ev_calculator.py after each run.
-  - Shows: tier badge (🟢🟡🔴🎰), bet title, book/odds/game time, PlaybookIQ bar (▓░ blocks), velo trend emoji + label, K-rate rank sentence, Claude AI narrative
+  - Shows: tier badge (🟢🟡🔴🎰), bet title, book/odds/game time, PlaybookIQ star rating (⭐–⭐⭐⭐⭐⭐) + score + label, velo trend emoji + label, K-rate rank sentence, park context line, Claude AI narrative
   - Hides: model prob, edge %, EV %, Kelly stake
   - K-rate rank: loads team_krates.csv, ranks opponent among all 30 teams for the pitcher's handedness
+  - Park line: `🏟️ {park_name} — {park_k_label} (K-factor: {park_k_factor})` shown between weather and narrative
   - Claude narrative: 2-3 sentences, casual tone, written for a casual bettor — uses pitcher name, K/9, xFIP, velo trend, opponent context
   - `dry_run=True` prints terminal preview without sending
 - **Tier badges by EV**: Conservative 4-7% (🟢), Moderate 7-12% (🟡), Aggressive 12-20% (🔴), Degen 20%+ (🎰)
-- **PlaybookIQ score (0-100)**: redesigned 2026-04-07 to measure confidence and trustworthiness, not model-vs-book disagreement. Five components:
+- **PlaybookIQ score (0-100)**: redesigned 2026-04-07 to measure confidence and trustworthiness, not model-vs-book disagreement. Five components (raw max = 103, rescaled ×100/103):
   - **Data Reliability (25 pts)**: pitcher's `hist_reliability` score (80+→25, 60-79→18, 40-59→10, <40→4). Capped at 8 if `low_history=True`.
-  - **Signal Alignment (25 pts)**: counts how many contextual factors support the bet direction — velo trend aligned (+6), umpire adjustment aligned (+6), team K-rate matchup aligned (+6), xFIP quality <3.20→+4 / 3.20-3.80→+2, K prop wind neutral (+3). Max 25.
+  - **Signal Alignment (max 28 pts, rescaled)**: counts contextual factors supporting the bet direction — velo trend aligned (+6), umpire adjustment aligned (+6), team K-rate matchup aligned (+6), xFIP quality <3.20→+4 / 3.20-3.80→+2, K prop wind neutral (+3), park factor aligned with bet direction (+3). Max raw = 28.
   - **Market Reasonableness (25 pts)**: edge 2-5%→25, 5-8%→20, 8-12%→12, 12-18%→5, 18%+→0. `ev_suspect=True`→0 always.
   - **Tier Confidence (15 pts)**: Conservative→15, Moderate→10, Aggressive→4, Degen→0.
   - **Bet Type Clarity (10 pts)**: Over with K/9>9.0 and line>5.5→10; Under with K/9<7.5 and line<5.5→10; within 1.5 Ks of expected total→7; low line (≤3.5)→2; other→5.
   - Conservative signals consistently outscore Degen signals (verified: Conservative ~70-76, Degen ~29-51 on 2026-04-07 data).
   - All five component scores stored as separate columns in ev_signals.csv: `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq`.
   - Components computed in `ev_calculator.py:build_ev_signals()`, stored pre-computed. Discord reads the stored value rather than recalculating.
-  - **Supabase note**: `iq_*` columns not yet in ev_signals Supabase table — add when ready via migration.
+  - **`iq_*` columns confirmed live in Supabase** (migration ran 2026-04-07).
+- **`playbookiq_stars(score) -> tuple`**: converts 0-100 score to star display + label for Discord embeds.
+  - 90+→⭐⭐⭐⭐⭐ Elite, 75-89→⭐⭐⭐⭐ Strong, 60-74→⭐⭐⭐ Good, 45-59→⭐⭐ Fair, <45→⭐ Weak
+  - Embed IQ line: `{stars}  **{score}**  {label}   {trend_emoji}  {trend_label}`
+- **`calculate_playbook_iq_components(signal: dict) -> dict`**: computes all five IQ components from a signal dict. Returns `{iq_reliability, iq_alignment, iq_market, iq_tier, iq_clarity, playbookiq}`.
+- **`calculate_playbook_iq(signal: dict) -> int`**: reads pre-computed `playbookiq` from the signal dict; falls back to `calculate_playbook_iq_components()` only if not present.
 - Game time looked up live from MLB Stats API
 - Bet alerts → `DISCORD_WEBHOOK_CONSERVATIVE`
 - `fire_alerts_from_signals()`: tiered caps — Conservative 5, Moderate 4, Aggressive 3, Degen 1 — sorted by PlaybookIQ descending within each tier
