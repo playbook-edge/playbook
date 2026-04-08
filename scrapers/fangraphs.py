@@ -14,15 +14,35 @@ No API keys required.
 import os
 import sys
 import time
+import requests
 import pandas as pd
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import pybaseball
 from pybaseball import statcast, pitching_stats
 from pybaseball import cache
 
 cache.enable()
+
+# ── Patch pybaseball's requests calls to use browser headers ──────────────
+# FanGraphs blocks server IPs (Railway) that don't look like a browser.
+# We monkey-patch requests.get so every pybaseball call carries realistic headers.
+_BROWSER_HEADERS = {
+    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer':         'https://www.fangraphs.com/',
+}
+_original_requests_get = requests.get
+def _patched_get(url, **kwargs):
+    if 'fangraphs.com' in str(url):
+        hdrs = dict(_BROWSER_HEADERS)
+        hdrs.update(kwargs.pop('headers', {}))
+        kwargs['headers'] = hdrs
+    return _original_requests_get(url, **kwargs)
+requests.get = _patched_get
 
 RAW_DIR        = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
 TEAM_KRATES    = os.path.join(RAW_DIR, 'team_krates.csv')
@@ -305,17 +325,21 @@ def build_pitcher_leaderboard():
             print(f'  Using cached pitcher_stats.csv from today ({len(cached)} pitchers) [0s]')
             return cached
 
-    # ── Try pybaseball → FanGraphs ───────────────────────────────────────────
-    # FanGraphs blocks server IPs (Railway, etc.) with 403.  We attempt the
-    # fetch and fall back to yesterday's file rather than crashing the pipeline.
-    time.sleep(DELAY)
-    try:
-        raw = pitching_stats(CURRENT_YEAR, CURRENT_YEAR, qual=0)
-        leaderboard = _parse_leaderboard(raw)
-        print(f'  FanGraphs fetch successful ({len(leaderboard)} starters)')
-        return leaderboard
-    except Exception as e:
-        print(f'  WARNING: FanGraphs fetch failed ({e})')
+    # ── Try pybaseball → FanGraphs (with retry) ──────────────────────────────
+    # Browser headers are patched above. On first failure, wait 15s and retry
+    # once before falling back to the cached file.
+    for attempt in (1, 2):
+        time.sleep(DELAY if attempt == 1 else 15)
+        try:
+            raw = pitching_stats(CURRENT_YEAR, CURRENT_YEAR, qual=0)
+            leaderboard = _parse_leaderboard(raw)
+            print(f'  FanGraphs fetch successful (attempt {attempt}) — {len(leaderboard)} starters')
+            return leaderboard
+        except Exception as e:
+            status = getattr(getattr(e, 'response', None), 'status_code', 'N/A')
+            print(f'  WARNING: FanGraphs attempt {attempt} failed — HTTP {status} ({type(e).__name__}: {e})')
+            if attempt == 1:
+                print('  Retrying in 15 seconds...')
 
     # ── Fallback: use yesterday's cached file ────────────────────────────────
     # Pitcher K/9 and xFIP change very slowly; one stale day is fine.

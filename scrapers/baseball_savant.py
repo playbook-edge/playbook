@@ -212,6 +212,59 @@ def fetch_pitcher_statcast(mlb_id, name):
 
 
 # ---------------------------------------------------------------------------
+# Step 3b: Calculate xFIP from Statcast data
+#
+# xFIP = ((13 × (FB × lgHR/FB)) + (3 × (BB + HBP)) - (2 × K)) / IP + FIP_CONSTANT
+#
+# All components are derivable from the Statcast pitch rows already being
+# pulled for each pitcher.  This is our fallback when FanGraphs is blocked.
+# ---------------------------------------------------------------------------
+
+_LG_HR_FB   = 0.105   # stable MLB league-average HR/FB rate
+_FIP_CONST  = 3.10    # FIP constant (normalises to ERA scale)
+
+def calculate_xfip_from_statcast(df: pd.DataFrame) -> float | None:
+    """
+    Compute xFIP from raw Statcast pitch-level rows for one pitcher.
+    Returns xFIP rounded to 2 decimal places, or None if insufficient data.
+
+    Requires at least 10 plate appearances to produce a meaningful estimate.
+    """
+    if df is None or df.empty:
+        return None
+
+    pa_rows = df[df['events'].notna()].copy()
+    if len(pa_rows) < 10:
+        return None
+
+    events = pa_rows['events']
+
+    k_count   = int((events == 'strikeout').sum())
+    bb_count  = int((events == 'walk').sum())
+    hbp_count = int((events == 'hit_by_pitch').sum())
+
+    # Fly balls from bb_type column
+    bb_type = pa_rows.get('bb_type', pd.Series(dtype=str)) if 'bb_type' in pa_rows.columns else pd.Series(dtype=str)
+    fb_count = int((bb_type == 'fly_ball').sum())
+
+    # Innings pitched: sum outs recorded per plate appearance / 3
+    # Each PA that ends in an out contributes 1 out; DPs contribute 2.
+    out_events_1 = {'strikeout', 'field_out', 'force_out', 'fielders_choice_out',
+                    'other_out', 'strikeout_double_play'}
+    out_events_2 = {'double_play', 'grounded_into_double_play', 'strikeout_double_play'}
+    outs = (
+        events.isin(out_events_1).sum()
+        + events.isin(out_events_2).sum()  # extra out for DPs
+    )
+    ip = outs / 3.0
+    if ip < 1.0:
+        return None
+
+    xfip = ((13 * (fb_count * _LG_HR_FB)) + (3 * (bb_count + hbp_count)) - (2 * k_count)) / ip + _FIP_CONST
+    return round(xfip, 2)
+
+
+# ---------------------------------------------------------------------------
 # Step 4: Compute per-pitcher metrics from raw Statcast rows
 # ---------------------------------------------------------------------------
 
@@ -325,22 +378,24 @@ def run():
         print(f"  [{i}/{len(starters)}] {p['name']} — {p['team']}")
         sc_data              = fetch_pitcher_statcast(p['mlb_id'], p['name'])
         metrics              = compute_metrics(sc_data)
+        xfip_sc              = calculate_xfip_from_statcast(sc_data)
         avg_ip, hist_avg_ip, curr_gs = fetch_avg_ip(p['mlb_id'], p['name'], hist_ip)
-        print(f"    avg_ip = {avg_ip} IP/start  curr_gs = {curr_gs}  (hist: {hist_avg_ip})")
+        print(f"    avg_ip = {avg_ip} IP/start  curr_gs = {curr_gs}  xfip_statcast = {xfip_sc}  (hist: {hist_avg_ip})")
         rows.append({
-            'name':         p['name'],
-            'team':         p['team'],
-            'throws':       p.get('throws', 'R'),
-            'k_pct':        metrics['k_pct'],
-            'xfip':         lookup_xfip(p['name']),
-            'velo':         metrics['velo'],
-            'velo_trend':   metrics['velo_trend'],
-            'spin_rate':    metrics['spin_rate'],
-            'pitch_mix':    metrics['pitch_mix'],
-            'babip':        metrics['babip'],
-            'avg_ip':       avg_ip,
-            'hist_avg_ip':  hist_avg_ip,
-            'curr_gs':      curr_gs,
+            'name':           p['name'],
+            'team':           p['team'],
+            'throws':         p.get('throws', 'R'),
+            'k_pct':          metrics['k_pct'],
+            'xfip':           lookup_xfip(p['name']),
+            'xfip_statcast':  xfip_sc,
+            'velo':           metrics['velo'],
+            'velo_trend':     metrics['velo_trend'],
+            'spin_rate':      metrics['spin_rate'],
+            'pitch_mix':      metrics['pitch_mix'],
+            'babip':          metrics['babip'],
+            'avg_ip':         avg_ip,
+            'hist_avg_ip':    hist_avg_ip,
+            'curr_gs':        curr_gs,
         })
 
     report = pd.DataFrame(rows)

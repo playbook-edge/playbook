@@ -708,18 +708,34 @@ def build_ev_signals(props_df:    pd.DataFrame,
             kelly_under = kelly_stake(model_under, under_odds, bankroll,
                                       max_kelly=KELLY_CAPS[tier_under])
 
-        # Pull xFIP — current season first, then historical baseline, then league avg
-        # Fix 2: early in the season (before ~mid-April) FanGraphs has no xFIP yet.
-        # Falling back to hist_xfip from player_baselines.csv keeps PlaybookIQ accurate.
-        # If neither is available, 4.20 is the MLB league average — neutral, not zero.
-        xfip_val = None
-        if stats_name:
+        # Pull xFIP — four-source fallback chain (tracked in xfip_source column):
+        #   1. FanGraphs current season (pitcher_stats.csv) — most accurate
+        #   2. Statcast-calculated xFIP (savant_today.csv xfip_statcast) — 30-day window
+        #   3. Historical 2yr weighted xFIP (player_baselines.csv hist_xfip)
+        #   4. MLB league average 4.20 — neutral last resort
+        xfip_val    = None
+        xfip_source = 'league_average'
+
+        if stats_name and not stats_df.empty:
             st = stats_df[stats_df['name'] == stats_name].iloc[0]
-            xfip_val = st.get('xfip') if pd.notna(st.get('xfip')) else None
+            v  = st.get('xfip')
+            if v is not None and pd.notna(v):
+                xfip_val    = float(v)
+                xfip_source = 'fangraphs'
+
+        if xfip_val is None and sv_row is not None:
+            v = sv_row.get('xfip_statcast')
+            if v is not None and pd.notna(v):
+                xfip_val    = float(v)
+                xfip_source = 'statcast_calculated'
+
         if xfip_val is None and bl is not None and pd.notna(bl.get('hist_xfip')):
-            xfip_val = float(bl['hist_xfip'])   # historical 2yr weighted xFIP
+            xfip_val    = float(bl['hist_xfip'])
+            xfip_source = 'historical'
+
         if xfip_val is None:
-            xfip_val = 4.20                     # league average — prevents scoring zero
+            xfip_val    = 4.20
+            xfip_source = 'league_average'
 
         base = {
             'player':           player,
@@ -735,6 +751,7 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'hist_reliability': hist_reliability,
             'ip_per_start':     round(ip_per_start, 1),
             'xfip':             xfip_val,
+            'xfip_source':      xfip_source,
             'velo_trend':       round(velo_trend, 1) if velo_trend is not None else None,
             'velo_factor':      round(velo_factor, 3),
             'spin_rate':        round(spin_rate, 0) if spin_rate is not None else None,

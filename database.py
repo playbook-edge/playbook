@@ -125,6 +125,7 @@ def log_ev_signals(signals_df: pd.DataFrame, run_date=None) -> int:
             'hist_reliability':      int(float(_clean(r.get('hist_reliability')))) if _clean(r.get('hist_reliability')) is not None else None,
             'ip_per_start':          _clean(r.get('ip_per_start')),
             'xfip':                  _clean(r.get('xfip')),
+            'xfip_source':           _clean(r.get('xfip_source')),
             'opp_team':              _clean(r.get('opp_team')),
             'opp_k_pct':             _clean(r.get('opp_k_pct')),
             'matchup_factor':        _clean(r.get('matchup_factor')),
