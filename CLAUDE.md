@@ -342,7 +342,20 @@ Positive = profitable long-term. Real edges on live props will be 1-6%, not 20-4
 
 All tables confirmed live and accepting writes as of 2026-04-07.
 
-`ev_signals` schema migrated 2026-04-06 to add 16 new columns: `velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`. `duplicate` column added 2026-04-06. `innings_capped` (BOOLEAN) and `matchup_pa_count` (INTEGER) columns added 2026-04-07. `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq` (all INTEGER) added 2026-04-07 for PlaybookIQ redesign — migration confirmed live. `xfip_source` (TEXT), `park_name` (TEXT), `park_k_factor` (INTEGER), `park_k_label` (TEXT) added 2026-04-07 — run migration before next pipeline.
+`ev_signals` schema history:
+- 2026-04-06: added 16 columns (`velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`) + `duplicate`
+- 2026-04-07 (morning): `innings_capped` (BOOLEAN), `matchup_pa_count` (INTEGER)
+- 2026-04-07 (session): `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq` (all INTEGER) — **migration confirmed live**
+- 2026-04-07 (session): `xfip_source` (TEXT), `park_name` (TEXT), `park_k_factor` (INTEGER), `park_k_label` (TEXT) — **⚠ migration NOT yet run — do before tomorrow's pipeline**
+
+**Pending Supabase migration (run before 2026-04-08 pipeline):**
+```sql
+ALTER TABLE ev_signals
+  ADD COLUMN IF NOT EXISTS xfip_source   TEXT,
+  ADD COLUMN IF NOT EXISTS park_name     TEXT,
+  ADD COLUMN IF NOT EXISTS park_k_factor INTEGER,
+  ADD COLUMN IF NOT EXISTS park_k_label  TEXT;
+```
 
 `pipeline_runs` notes field now includes `odds_api_quota:N` appended by `log_pipeline_run()` — written by `main.py` reading `data/raw/odds_api_quota.txt` after the odds scraper step. No schema migration needed.
 
@@ -365,7 +378,21 @@ All tables confirmed live and accepting writes as of 2026-04-07.
 5. **Line movement tracking** ✓ BUILT
    `scrapers/odds_api.py snapshot` → `alerts/paper_trading.py capture_line_movement()`. Railway service `playbook-snapshot`, cron `30 22 * * *` (6:30 PM ET). Saves `data/raw/props_gameday_snapshot.csv` and writes to Supabase `line_movement` table. `movement_direction` is `toward` (market agrees), `against` (market disagrees), or `flat`. Run manually: `python scrapers/odds_api.py snapshot`.
 
-6. **Batter props**
+6. **Park factors** ✓ BUILT (2026-04-07)
+   `scrapers/park_factors.py` — static 30-park dictionary. Wired into ev_calculator as Layer 4.5. Multiplier applied to adjusted_k9 after batter matchup. Park line in Discord embeds. +3 pts to PlaybookIQ Signal Alignment when park aligns with bet direction.
+
+7. **FanGraphs resilience** ✓ BUILT (2026-04-07)
+   FanGraphs blocks Railway IPs at the network level (confirmed 403 IP-block, not user-agent). Three mitigations:
+   - Browser headers patched onto all pybaseball FanGraphs calls (no-op for now but ready if policy changes)
+   - `calculate_xfip_from_statcast()` in baseball_savant.py computes xFIP from Statcast pitch rows; saved as `xfip_statcast` in savant_today.csv
+   - Four-source xFIP fallback chain: fangraphs → statcast_calculated → historical → league_average (4.20). Source tracked in `xfip_source` column.
+   - `curr_gs` (games started) now saved to savant_today.csv from MLB Stats API — ev_calculator uses it for blending weight when FanGraphs is unavailable
+   - Model runs fully on MLB Stats API + Statcast alone if FanGraphs is completely down
+
+8. **PlaybookIQ redesign** ✓ BUILT (2026-04-07)
+   Replaced 4-component EV-rewarding formula with 5-component confidence/trustworthiness formula. Conservative signals now outscore Degen signals (verified: Conservative ~70-76, Degen ~29-51). Components stored per-signal for auditability. Star rating display (⭐ to ⭐⭐⭐⭐⭐) replaces progress bar in Discord embeds.
+
+9. **Batter props**
    Expand beyond pitchers to HR, hits, RBI props. Requires new scrapers, new model logic, and new prop types. Later-season project once pitcher-side model is validated.
 
 ## Kelly Criterion — Tier-Based Caps (updated 2026-04-05)
