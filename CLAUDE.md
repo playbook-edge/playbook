@@ -346,16 +346,7 @@ All tables confirmed live and accepting writes as of 2026-04-07.
 - 2026-04-06: added 16 columns (`velo_trend`, `velo_factor`, `spin_rate`, `pitch_mix`, `throws`, `prob_capped`, `low_line_note`, `umpire_name`, `umpire_adjustment`, `kelly_cap_applied`, `low_history`, `ev_suspect`, `weather_wind_label`, `weather_wind_factor`, `weather_temp_f`, `weather_precip_pct`) + `duplicate`
 - 2026-04-07 (morning): `innings_capped` (BOOLEAN), `matchup_pa_count` (INTEGER)
 - 2026-04-07 (session): `iq_reliability`, `iq_alignment`, `iq_market`, `iq_tier`, `iq_clarity`, `playbookiq` (all INTEGER) — **migration confirmed live**
-- 2026-04-07 (session): `xfip_source` (TEXT), `park_name` (TEXT), `park_k_factor` (INTEGER), `park_k_label` (TEXT) — **⚠ migration NOT yet run — do before tomorrow's pipeline**
-
-**Pending Supabase migration (run before 2026-04-08 pipeline):**
-```sql
-ALTER TABLE ev_signals
-  ADD COLUMN IF NOT EXISTS xfip_source   TEXT,
-  ADD COLUMN IF NOT EXISTS park_name     TEXT,
-  ADD COLUMN IF NOT EXISTS park_k_factor INTEGER,
-  ADD COLUMN IF NOT EXISTS park_k_label  TEXT;
-```
+- 2026-04-07 (session): `xfip_source` (TEXT), `park_name` (TEXT), `park_k_factor` (INTEGER), `park_k_label` (TEXT) — **migration confirmed live**
 
 `pipeline_runs` notes field now includes `odds_api_quota:N` appended by `log_pipeline_run()` — written by `main.py` reading `data/raw/odds_api_quota.txt` after the odds scraper step. No schema migration needed.
 
