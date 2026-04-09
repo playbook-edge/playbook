@@ -1051,6 +1051,37 @@ def run():
             print(f'\n  Fix 1 — Deduplication: {dup_count} row(s) marked duplicate '
                   f'(same prop at a lower-payout book — logged but excluded from alerts)')
 
+    # ── DIAGNOSTIC: Pipeline signal summary ──────────────────────────────────
+    print(f'\n{"─" * 60}')
+    print(f'  SIGNAL PIPELINE SUMMARY')
+    print(f'{"─" * 60}')
+    print(f'  Props rows loaded:        {len(props_df)}')
+    print(f'  Total rows generated:     {len(signals)}')
+    if not signals.empty:
+        print(f'  EV range (all rows):      {signals["ev"].min():+.1%}  to  {signals["ev"].max():+.1%}')
+        pre_filter_flagged = int(signals['flag'].sum())
+        print(f'  Above {EV_THRESHOLD:.0%} threshold:      {pre_filter_flagged} row(s)')
+        suspect_ct = int(signals['ev_suspect'].sum()) if 'ev_suspect' in signals.columns else 0
+        dup_ct     = int(signals['duplicate'].sum())  if 'duplicate'  in signals.columns else 0
+        print(f'  Filtered ev_suspect:      {suspect_ct}')
+        print(f'  Filtered duplicate:       {dup_ct}')
+        # Simulate what discord/paper trading actually receives
+        final_flagged = signals[signals['flag']].copy()
+        if 'ev_suspect' in signals.columns:
+            final_flagged = final_flagged[~final_flagged['ev_suspect']]
+        if 'duplicate' in signals.columns:
+            final_flagged = final_flagged[~final_flagged['duplicate']]
+        print(f'  Remaining for alerts:     {len(final_flagged)}')
+        has_natural_degen = (final_flagged['ev'] >= 0.20).any() if not final_flagged.empty else False
+        if has_natural_degen:
+            print(f'  Forced Degen:             NOT needed — natural Degen signal exists')
+        elif not final_flagged.empty:
+            top = final_flagged.iloc[0]
+            print(f'  Forced Degen:             WILL FIRE — promoting {top["player"]} ({top["ev"]:+.1%} EV) to 🎰')
+        else:
+            print(f'  Forced Degen:             SUPPRESSED — no signals available to promote (empty card)')
+    print(f'{"─" * 60}')
+
     # Save full results (includes suspect and duplicate rows — for the paper trail)
     out_path = os.path.join(PROCESSED, 'ev_signals.csv')
     signals.to_csv(out_path, index=False)

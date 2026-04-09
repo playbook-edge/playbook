@@ -20,7 +20,11 @@ import os
 import sys
 import csv
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# MLB season runs April–October (EDT, UTC-4).
+# Switch to timedelta(hours=-5) in November–March if ever resolving winter games.
+ET = timezone(timedelta(hours=-4))
 
 import pandas as pd
 
@@ -286,7 +290,7 @@ def log_bets_from_signals(signals_df: pd.DataFrame,
         bankroll_after  = round(bankroll - stake, 2)   # stake is committed
 
         trade = {
-            'date':            datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'date':            datetime.now(ET).strftime('%Y-%m-%d %H:%M'),
             'player':          row.get('player', ''),
             'prop_type':       row.get('prop_type', 'pitcher_strikeouts'),
             'side':            row.get('side', ''),
@@ -562,12 +566,22 @@ def auto_resolve():
 
     date_key = 'trade_date' if source == 'supabase' else 'date'
 
+    # ── Use ET date throughout resolve — Railway runs in UTC ─────────────────
+    # At 11:30 PM ET the UTC clock reads 3:30 AM the *next* day.
+    # datetime.now() would return tomorrow's date, making today's bets look
+    # "stale" and expiring them before they can be resolved.  Always derive
+    # the target date from Eastern Time so stored bet dates and lookup dates
+    # stay in sync.
+    today_et  = datetime.now(ET).strftime('%Y-%m-%d')
+    utc_now = datetime.now(timezone.utc)
+    print(f'\nLooking for PENDING bets on date: {today_et}  (Railway UTC: {utc_now.strftime("%Y-%m-%d %H:%M")} UTC)')
+    print(f'Found {len(pending_rows)} PENDING bet(s) total')
+
     # ── Remove stale pending trades (from a previous day) ────────────────────
     # A trade that is still PENDING the morning after its game date will never
     # resolve cleanly. Drop it now so it doesn't pollute the record.
-    today_str   = datetime.now().strftime('%Y-%m-%d')
-    stale_rows  = [r for r in pending_rows if str(r[date_key])[:10] < today_str]
-    pending_rows = [r for r in pending_rows if str(r[date_key])[:10] >= today_str]
+    stale_rows   = [r for r in pending_rows if str(r[date_key])[:10] < today_et]
+    pending_rows = [r for r in pending_rows if str(r[date_key])[:10] >= today_et]
 
     if stale_rows:
         print(f'\nRemoving {len(stale_rows)} stale pending trade(s) from previous day(s):')
@@ -617,19 +631,21 @@ def auto_resolve():
     game_statuses = {}
     box_scores    = {}
     for date in dates:
+        print(f'Querying MLB API for games on: {date}')
         game_statuses[date] = _fetch_game_statuses(date)
         box_scores[date]    = _fetch_pitcher_results(date)
-        status_summary = ', '.join(
-            f'{s["state"]}' for s in game_statuses[date].values()
-        ) or 'none found'
-        print(f'  {date}: {len(box_scores[date])} Final, statuses: [{status_summary}]')
+        statuses_all = list(game_statuses[date].values())
+        n_final    = sum(1 for s in statuses_all if s['state'] == 'Final')
+        n_live     = sum(1 for s in statuses_all if s['state'] == 'In Progress')
+        n_postponed = sum(1 for s in statuses_all if s['state'] in POSTPONE_STATES)
+        n_preview  = sum(1 for s in statuses_all if s['state'] == 'Preview')
+        print(f'  Found {len(statuses_all)} games — Final: {n_final}  In Progress: {n_live}  Postponed: {n_postponed}  Preview: {n_preview}')
 
     # Fetch closing odds once — a single batch call before the resolve loop.
     # At 11:30 PM most games have already started so the API typically returns
     # nothing.  That is fine — we log null and move on.
-    today_str    = datetime.now().strftime('%Y-%m-%d')
     print(f'\nFetching closing odds...')
-    closing_odds = _fetch_closing_odds(today_str)
+    closing_odds = _fetch_closing_odds(today_et)
 
     print()
     updated  = False
@@ -661,7 +677,9 @@ def auto_resolve():
             if len(matches) == 1:
                 game_info = list(matches.values())[0]
 
-        game_state = game_info['state'] if game_info else None
+        game_state   = game_info['state'] if game_info else None
+        match_found  = game_info is not None
+        print(f'  Attempting to resolve {player} — game status: {game_state or "NOT FOUND"}  match found: {match_found}')
 
         # ── In Progress: game is live, leave PENDING and skip ───────────────
         if game_state in IN_PROGRESS_STATES:
@@ -962,7 +980,7 @@ def capture_line_movement() -> list:
         print('\n  No pending trades to check.')
         return []
 
-    today_str = datetime.now().strftime('%Y-%m-%d')
+    today_str = datetime.now(ET).strftime('%Y-%m-%d')
     print(f'\n  {len(pending_rows)} pending trade(s) — snapshot has {snapshot_df["player"].nunique()} pitcher(s)\n')
 
     results = []
