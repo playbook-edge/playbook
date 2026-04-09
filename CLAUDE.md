@@ -149,7 +149,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - **Synthetic props fallback**: when no live props exist, generates lines from K/9 for testing
 - Flags any prop above 4% EV; saves full results to `ev_signals.csv`
 - **EV threshold**: 2% (changed from 4%) — generates more signals for paper trading validation
-- **ev_suspect flag**: signals where EV > 18% on live props are flagged as suspect — logged to Supabase but excluded from Discord alerts and paper trading. Prevents inflated early-season data from generating fake Degen signals.
+- **ev_suspect flag**: signals where EV > 25% on live props are flagged as suspect — logged to Supabase but excluded from Discord alerts and paper trading. Prevents inflated early-season data from generating fake Degen signals. (Raised from 18% on 2026-04-09 — 18% was too aggressive early in the season, blocking legitimate Moderate/Aggressive signals.)
 - **duplicate flag**: after all signals are generated, props with the same pitcher + prop_type + side + line appearing from multiple books are deduplicated. Only the row with the best American odds (highest payout) is kept for alerts and paper trading. Lower-payout duplicates get `duplicate=True` — still logged to Supabase for reference but excluded from Discord and paper trades.
 - **xFIP fallback (Fix 2)**: when a pitcher's current-season xFIP is None (common all of April), `build_ev_signals()` falls back to `hist_xfip` from `player_baselines.csv`, then to `4.20` (MLB league average) as a last resort. Prevents the PlaybookIQ xFIP component from scoring a flat neutral when historical data is available. A scope report is printed on each run showing how many of today's starters needed the fallback.
 - **low_history flag**: pitchers with fewer than 8 total GS across 2024+2025 → 95% historical weight, 0.65 probability cap. Protects against injury returnees and callups with tiny historical samples.
@@ -202,6 +202,7 @@ After all 7 steps, `send_pipeline_summary()` fires to the health channel.
 - Sends running P&L summary embed after all bets are placed
 - **Auto-resolve**: `python alerts/paper_trading.py auto_resolve` — hits MLB Stats API box scores, marks each PENDING bet WIN or LOSS, fires updated P&L to Discord
   - Checks game status first: Final → resolve; In Progress → skip; Postponed/Suspended/Cancelled → increment postpone_count, health alert at 3
+  - **UTC date fix (2026-04-09)**: Railway runs in UTC. At 11:30 PM ET the UTC clock reads 3:30 AM the next day — `datetime.now()` was returning tomorrow's date, making today's bets look stale and marking them EXPIRED before resolution. All date logic now uses `datetime.now(ET)` with `ET = timezone(timedelta(hours=-4))`. The log prints both ET date and UTC time for verification.
   - Captures closing odds from Odds API and logs CLV (closing_implied_prob - opening_implied_prob) per resolved bet
   - Avg CLV reported in nightly P&L Discord embed
 - **Manual resolve**: `python alerts/paper_trading.py resolve` — interactive fallback
