@@ -787,7 +787,7 @@ def build_ev_signals(props_df:    pd.DataFrame,
             'low_history':       low_history,
             'innings_capped':    innings_capped,
             'matchup_pa_count':  matchup_pa_count,
-            'ev_suspect':        False,   # overwritten in run() for live props with EV > 15%
+            'ev_suspect':        False,   # overwritten in run() for live props with EV > 25%
             # ── Weather context (informational — not applied to Poisson model) ──
             **_weather_cols(prop.get('matchup', ''), weather_lookup),
         }
@@ -1027,10 +1027,10 @@ def run():
     # Supabase so we have a paper trail, but it is excluded from Discord alerts
     # and paper trading so we never act on it.
     if not using_synthetic:
-        signals.loc[signals['ev'] > 0.18, 'ev_suspect'] = True
+        signals.loc[signals['ev'] > 0.25, 'ev_suspect'] = True
     suspect_count = int(signals['ev_suspect'].sum()) if not signals.empty else 0
     if suspect_count > 0:
-        print(f'\n  ⚠  {suspect_count} signal(s) flagged ev_suspect (EV > 15% on live prop) — logged but excluded from Discord')
+        print(f'\n  ⚠  {suspect_count} signal(s) flagged ev_suspect (EV > 25% on live prop) — logged but excluded from Discord')
 
     # Fix 1 — Deduplicate across books before alerts and paper trades.
     # When the same pitcher prop (same player + prop_type + side + line) appears
