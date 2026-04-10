@@ -927,14 +927,23 @@ def run():
     savant_path = os.path.join(RAW, 'savant_today.csv')
     props_path  = os.path.join(RAW, 'todays_props.csv')
 
-    for path in [stats_path, savant_path]:
-        if not os.path.exists(path):
-            print(f'Missing required file: {path}')
-            print('Run scrapers/baseball_savant.py and scrapers/fangraphs.py first.')
-            return
+    # savant_today.csv is the only hard requirement — it drives all starters.
+    # pitcher_stats.csv (FanGraphs) is optional: Railway's ephemeral disk means
+    # it may not exist if FanGraphs is 403-blocked. build_ev_signals() falls back
+    # to Statcast data automatically when stats_df is empty.
+    if not os.path.exists(savant_path):
+        print(f'Missing required file: {savant_path}')
+        print('Run scrapers/baseball_savant.py first.')
+        return
 
-    stats_df  = pd.read_csv(stats_path)
     savant_df = pd.read_csv(savant_path)
+
+    if os.path.exists(stats_path):
+        stats_df = pd.read_csv(stats_path)
+        print(f'FanGraphs stats loaded: {len(stats_df)} pitchers')
+    else:
+        stats_df = pd.DataFrame()
+        print('FanGraphs pitcher_stats.csv not found — running on Statcast data only')
 
     # Load or synthesise props
     using_synthetic = False
